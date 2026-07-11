@@ -3,9 +3,11 @@
 btdig-torznab — Torznab bridge for btdig.com
 
 Makes BTDig available as a standard Torznab indexer for
-Sonarr, Radarr, Lidarr, and other *arr applications.
+Sonarr, Radarr, Lidarr, Prowlarr, and other *arr applications.
 
 No external dependencies — Python 3 stdlib only.
+
+Threaded HTTP server handles multiple *arr clients concurrently.
 """
 
 import http.server
@@ -29,6 +31,16 @@ HOST = os.environ.get("BTDIG_HOST", "0.0.0.0")
 PORT = int(os.environ.get("BTDIG_PORT", "5555"))
 BTDIG_URL = os.environ.get("BTDIG_URL", "https://btdig.com")
 CACHE_TTL = int(os.environ.get("BTDIG_CACHE_TTL", "300"))  # seconds
+BTDIG_TIMEOUT = int(os.environ.get("BTDIG_TIMEOUT", "300"))  # seconds, 5 min
+
+# Torznab category to use per search type
+CAT_MAP = {
+    "search": "1000",   # Other
+    "tv-search": "5000",  # TV
+    "movie": "2000",     # Movies
+    "music": "3000",     # Audio
+    "book": "4000",      # Books
+}
 
 # Torznab category to use per search type
 CAT_MAP = {
@@ -51,7 +63,7 @@ class TorrentResult:
     magnet: str
     size_bytes: int
     details_url: str
-    pub_date: str  # RSS-compatible date string
+    pub_date: str       # RSS-compatible date string
     seeders: int = 0
     leechers: int = 0
 
@@ -218,7 +230,7 @@ class BTDigScraper:
         url = f"{BTDIG_URL}/search?q={urllib.parse.quote(query)}&order=0"
         req = urllib.request.Request(url, headers={"User-Agent": self.USER_AGENT})
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=BTDIG_TIMEOUT) as r:
                 html = r.read().decode("utf-8", errors="replace")
         except Exception as e:
             return self._error_xml(f"HTTP error: {e}")
@@ -325,7 +337,7 @@ class BTDigScraper:
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler
+# HTTP handler (thread-safe, stateless)
 # ---------------------------------------------------------------------------
 
 _scraper = BTDigScraper()
@@ -389,9 +401,13 @@ class TorznabHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    sv = http.server.HTTPServer((HOST, PORT), TorznabHandler)
+    sv = http.server.ThreadingHTTPServer((HOST, PORT), TorznabHandler)
+    # Allow socket reuse so restart doesn't hit "Address already in use"
+    sv.allow_reuse_address = True
     print(f"[btdig] Torznab bridge listening on {HOST}:{PORT}", flush=True)
     print(f"[btdig] Torznab endpoint: http://<host>:{PORT}/torznab/api", flush=True)
+    print(f"[btdig] Concurrent clients: yes (ThreadingHTTPServer)", flush=True)
+    print(f"[btdig] BTDig fetch timeout: {BTDIG_TIMEOUT}s", flush=True)
     try:
         sv.serve_forever()
     except KeyboardInterrupt:

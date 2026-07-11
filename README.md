@@ -22,7 +22,8 @@ Sonarr/Radarr → http://192.168.1.67:5555/torznab/api?t=search&q=...
 
 - **Zero external dependencies** — Python 3 stdlib only (`http.server`, `urllib`, `html.parser`)
 - **Single-file** — one `btdig_torznab.py` script, one systemd unit
-- **Configurable via env vars** — port, bind, cache TTL
+- **Threaded HTTP server** — handles multiple *arr clients concurrently; one slow BTDig response won't block other queries
+- **Configurable via env vars** — port, bind, cache TTL, fetch timeout
 - **Runs as `btdig-torznab` user** — least privilege
 
 ## Torznab API
@@ -64,6 +65,7 @@ Returns standard Torznab RSS+XML with magnet links, sizes, seeders, and upload d
 | `BTDIG_PORT` | `5555` | Listen port |
 | `BTDIG_CACHE_TTL` | `300` | Cache TTL in seconds |
 | `BTDIG_URL` | `https://btdig.com` | BTDig base URL |
+| `BTDIG_TIMEOUT` | `300` | HTTP fetch timeout (seconds) |
 
 ## ext.to Torznab bridge
 
