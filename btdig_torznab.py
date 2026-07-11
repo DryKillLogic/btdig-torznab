@@ -271,8 +271,11 @@ class BTDigScraper:
             ET.SubElement(item, "title").text = r.title
             ET.SubElement(item, "guid", isPermaLink="false").text = r.magnet
             ET.SubElement(item, "link").text = r.details_url or r.magnet
-            if r.pub_date:
-                ET.SubElement(item, "pubDate").text = r.pub_date
+            # Sonarr/Radarr rejects the entire feed if any item lacks pubDate.
+            # Fallback to current time when page doesn't provide age data.
+            ET.SubElement(item, "pubDate").text = (
+                r.pub_date or time.strftime("%a, %d %b %Y %H:%M:%S +0000",
+                                            time.gmtime()))
             ET.SubElement(item, "description").text = (
                 f"Size: {self._human_size(r.size_bytes)} | "
                 f"Magnet: {r.magnet[:60]}...")
