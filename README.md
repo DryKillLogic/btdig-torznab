@@ -66,6 +66,7 @@ Returns standard Torznab RSS+XML with magnet links, sizes, seeders, and upload d
 | `BTDIG_CACHE_TTL` | `300` | Cache TTL in seconds |
 | `BTDIG_URL` | `https://btdig.com` | BTDig base URL |
 | `BTDIG_TIMEOUT` | `300` | HTTP fetch timeout (seconds) |
+| `BTDIG_REQUEST_TIMEOUT` | `600` | Client socket timeout (seconds) |
 
 ## ext.to Torznab bridge
 

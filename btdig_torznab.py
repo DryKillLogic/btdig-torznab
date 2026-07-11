@@ -31,7 +31,8 @@ HOST = os.environ.get("BTDIG_HOST", "0.0.0.0")
 PORT = int(os.environ.get("BTDIG_PORT", "5555"))
 BTDIG_URL = os.environ.get("BTDIG_URL", "https://btdig.com")
 CACHE_TTL = int(os.environ.get("BTDIG_CACHE_TTL", "300"))  # seconds
-BTDIG_TIMEOUT = int(os.environ.get("BTDIG_TIMEOUT", "300"))  # seconds, 5 min
+BTDIG_TIMEOUT = int(os.environ.get("BTDIG_TIMEOUT", "300"))  # seconds, fetch timeout
+BTDIG_REQUEST_TIMEOUT = int(os.environ.get("BTDIG_REQUEST_TIMEOUT", "600"))  # seconds, socket timeout per client request
 
 # Torznab category to use per search type
 CAT_MAP = {
@@ -344,6 +345,10 @@ _scraper = BTDigScraper()
 
 
 class TorznabHandler(http.server.BaseHTTPRequestHandler):
+    # Socket timeout per client request — if a client connects but stalls
+    # (partial request, slow read/write), the connection is dropped after
+    # this many seconds instead of hanging a thread forever.
+    timeout = BTDIG_REQUEST_TIMEOUT
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
@@ -408,6 +413,7 @@ def main():
     print(f"[btdig] Torznab endpoint: http://<host>:{PORT}/torznab/api", flush=True)
     print(f"[btdig] Concurrent clients: yes (ThreadingHTTPServer)", flush=True)
     print(f"[btdig] BTDig fetch timeout: {BTDIG_TIMEOUT}s", flush=True)
+    print(f"[btdig] Client socket timeout: {BTDIG_REQUEST_TIMEOUT}s", flush=True)
     try:
         sv.serve_forever()
     except KeyboardInterrupt:
