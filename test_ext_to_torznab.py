@@ -189,6 +189,24 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("hmac=", post)
         self.assertIn("timestamp=", post)
 
+    def test_build_public_base_url_prefers_public_host(self):
+        self.assertEqual(
+            ext._build_public_base_url("https://ext.myserver.stream", "0.0.0.0", 5556),
+            "https://ext.myserver.stream",
+        )
+
+    def test_build_public_base_url_falls_back_to_ext_host(self):
+        self.assertEqual(
+            ext._build_public_base_url("", "ext.myserver.stream", 5556),
+            "https://ext.myserver.stream",
+        )
+
+    def test_sanitize_redirect_url_ascii_safe(self):
+        url = "magnet:?xt=urn:btih:ABCDEF&dn=⭐+Test+Title"
+        self.assertEqual(ext._sanitize_redirect_url(url), url)
+        http_url = "https://ext.to/download/⭐/title"
+        self.assertIn("%E2%AD%90", ext._sanitize_redirect_url(http_url))
+
     def test_looks_like_token_error(self):
         self.assertTrue(ext.ExtToScraper._looks_like_token_error(
             {"success": False, "error": "Invalid token"}
@@ -457,6 +475,22 @@ class TestUrlBuilder(unittest.TestCase):
         self.assertIn("sort=age", url)
         self.assertIn("with_adult=1", url)
         self.assertNotIn("page=", url)
+
+    def test_build_search_url_sorts_by_seeders_when_requested(self):
+        url = self.scraper._build_url("test", 1, sort="seeds", order="desc")
+        self.assertIn("/browse/", url)
+        self.assertIn("q=test", url)
+        self.assertIn("sort=seeds", url)
+        self.assertIn("order=desc", url)
+
+    def test_build_search_url_includes_categories(self):
+        url = self.scraper._build_url("test", 1, categories=[1])
+        self.assertIn("/browse/", url)
+        self.assertIn("cat=1", url)
+
+    def test_build_search_url_joins_multiple_categories(self):
+        url = self.scraper._build_url("test", 1, categories=[1, 2])
+        self.assertIn("cat=1%2C2", url)
 
     def test_build_search_url_page_2(self):
         url = self.scraper._build_url("firefly", 2)

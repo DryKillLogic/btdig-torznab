@@ -22,31 +22,31 @@ Sonarr/Radarr → http://192.168.1.67:5555/torznab/api?t=search&q=...
 
 - **Zero external dependencies** — Python 3 stdlib only (`http.server`, `urllib`, `html.parser`)
 - **Single-file** — one `btdig_torznab.py` script, one systemd unit
-- **Threaded HTTP server** — handles multiple *arr clients concurrently; one slow BTDig response won't block other queries
+- **Threaded HTTP server** — handles multiple \*arr clients concurrently; one slow BTDig response won't block other queries
 - **Configurable via env vars** — port, bind, cache TTL, fetch timeout
 - **Runs as `btdig-torznab` user** — least privilege
 
 ## Torznab API
 
-| Endpoint | Method | Params |
-|----------|--------|--------|
-| `/torznab/api` | GET | `t=search&q=<query>` |
-| `/torznab/api` | GET | `t=tvsearch&q=<query>&season=&ep=` |
-| `/torznab/api` | GET | `t=movie&q=<query>` |
-| `/torznab/api` | GET | `t=caps` (capabilities) |
+| Endpoint       | Method | Params                             |
+| -------------- | ------ | ---------------------------------- |
+| `/torznab/api` | GET    | `t=search&q=<query>`               |
+| `/torznab/api` | GET    | `t=tvsearch&q=<query>&season=&ep=` |
+| `/torznab/api` | GET    | `t=movie&q=<query>`                |
+| `/torznab/api` | GET    | `t=caps` (capabilities)            |
 
 Returns standard Torznab RSS+XML with magnet links, sizes, seeders, and upload date.
 
 ## Fields extracted from btdig
 
-| Field | Source |
-|-------|--------|
-| Title | `div.torrent_name a` (text) |
-| Magnet link | `div.torrent_magnet a[href^='magnet:']` |
-| Size | `span.torrent_size` |
-| Age | `span.torrent_age` (parsed as relative date) |
-| btdig detail link | `div.torrent_name a[href]` |
-| Seeders | 0 (btdig doesn't show live seeder counts) |
+| Field             | Source                                       |
+| ----------------- | -------------------------------------------- |
+| Title             | `div.torrent_name a` (text)                  |
+| Magnet link       | `div.torrent_magnet a[href^='magnet:']`      |
+| Size              | `span.torrent_size`                          |
+| Age               | `span.torrent_age` (parsed as relative date) |
+| btdig detail link | `div.torrent_name a[href]`                   |
+| Seeders           | 0 (btdig doesn't show live seeder counts)    |
 
 ## Deployment
 
@@ -59,14 +59,14 @@ Returns standard Torznab RSS+XML with magnet links, sizes, seeders, and upload d
 
 ## Configuration
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `BTDIG_HOST` | `0.0.0.0` | Bind address |
-| `BTDIG_PORT` | `5555` | Listen port |
-| `BTDIG_CACHE_TTL` | `300` | Cache TTL in seconds |
-| `BTDIG_URL` | `https://btdig.com` | BTDig base URL |
-| `BTDIG_TIMEOUT` | `300` | HTTP fetch timeout (seconds) |
-| `BTDIG_REQUEST_TIMEOUT` | `600` | Client socket timeout (seconds) |
+| Env var                 | Default             | Description                     |
+| ----------------------- | ------------------- | ------------------------------- |
+| `BTDIG_HOST`            | `0.0.0.0`           | Bind address                    |
+| `BTDIG_PORT`            | `5555`              | Listen port                     |
+| `BTDIG_CACHE_TTL`       | `300`               | Cache TTL in seconds            |
+| `BTDIG_URL`             | `https://btdig.com` | BTDig base URL                  |
+| `BTDIG_TIMEOUT`         | `300`               | HTTP fetch timeout (seconds)    |
+| `BTDIG_REQUEST_TIMEOUT` | `600`               | Client socket timeout (seconds) |
 
 ## ext.to Torznab bridge
 
@@ -76,15 +76,15 @@ torrent indexers in 2026 (carrying much of the former TPG user base).
 
 ### Differences from btdig bridge
 
-| Aspect | btdig-torznab | ext-to-torznab |
-|--------|---------------|----------------|
-| Dependencies | None (stdlib) | `requests`, `beautifulsoup4` |
-| Cloudflare | No protection | Managed challenge (requires FlareSolverr) |
-| Magnet links | In HTML | HMAC-signed API |
-| Seeders/Peers | Not shown | Available |
-| Categories | Generic | Rich (Movies, TV, Music, Books, Games, etc.) |
-| Port | 5555 | 5556 |
-| On-demand magnet | No | Yes (`t=download`) |
+| Aspect           | btdig-torznab | ext-to-torznab                               |
+| ---------------- | ------------- | -------------------------------------------- |
+| Dependencies     | None (stdlib) | `requests`, `beautifulsoup4`                 |
+| Cloudflare       | No protection | Managed challenge (requires FlareSolverr)    |
+| Magnet links     | In HTML       | HMAC-signed API                              |
+| Seeders/Peers    | Not shown     | Available                                    |
+| Categories       | Generic       | Rich (Movies, TV, Music, Books, Games, etc.) |
+| Port             | 5555          | 5556                                         |
+| On-demand magnet | No            | Yes (`t=download`)                           |
 
 ### Architecture
 
@@ -147,30 +147,33 @@ python3 ext_to_torznab.py
 
 ### Configuration (ext.to)
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `EXT_TO_HOST` | `0.0.0.0` | Bind address |
-| `EXT_TO_PORT` | `5556` | Listen port |
-| `EXT_TO_URL` | `https://ext.to` | ext.to base URL |
-| `FLARESOLVERR_URL` | `http://localhost:8191` | FlareSolverr endpoint |
-| `FLARESOLVERR_TIMEOUT` | `60000` | FlareSolverr timeout (ms) |
-| `INCLUDE_ADULT` | `true` | Include adult (XXX) content |
-| `LOG_LEVEL` | `INFO` | Log level (DEBUG, INFO, WARNING) |
-| `EXT_TO_CACHE_TTL` | `300` | Cache TTL in seconds |
+| Env var                | Default                 | Description                                                                                       |
+| ---------------------- | ----------------------- | ------------------------------------------------------------------------------------------------- |
+| `EXT_TO_HOST`          | `0.0.0.0`               | Bind address for the local HTTP server                                                            |
+| `EXT_TO_PORT`          | `5556`                  | Listen port for the local HTTP server                                                             |
+| `PUBLIC_HOST`          | unset                   | Public hostname advertised in Torznab XML and redirect URLs; defaults to `EXT_TO_HOST` when unset |
+| `EXT_TO_URL`           | `https://ext.to`        | ext.to base URL                                                                                   |
+| `FLARESOLVERR_URL`     | `http://localhost:8191` | FlareSolverr endpoint                                                                             |
+| `FLARESOLVERR_TIMEOUT` | `60000`                 | FlareSolverr timeout (ms)                                                                         |
+| `INCLUDE_ADULT`        | `true`                  | Include adult (XXX) content                                                                       |
+| `LOG_LEVEL`            | `INFO`                  | Log level (DEBUG, INFO, WARNING)                                                                  |
+| `EXT_TO_CACHE_TTL`     | `300`                   | Cache TTL in seconds                                                                              |
+
+When `PUBLIC_HOST` is not set, the bridge reuses `EXT_TO_HOST` as the public-facing host. Keep the bind host local (for example `0.0.0.0:5556`) and set `PUBLIC_HOST` to the public hostname only when you need the Torznab feed to advertise a production URL instead of the bind address.
 
 ### Torznab API (ext.to)
 
 The same Torznab protocol as btdig, plus:
 
-| Feature | Details |
-|---------|---------|
-| `t=download` | On-demand magnet resolution for a GUID |
-| `t=search` | Free-text search |
-| `t=tvsearch` | TV search with `season`, `ep` params |
-| `t=movie` | Movie search |
-| `t=music`, `t=book` | Music and book search |
-| Categories | Full Torznab category tree (42 subcategories) |
-| Seeders/Peers | Live counts from ext.to (unlike btdig) |
+| Feature             | Details                                       |
+| ------------------- | --------------------------------------------- |
+| `t=download`        | On-demand magnet resolution for a GUID        |
+| `t=search`          | Free-text search                              |
+| `t=tvsearch`        | TV search with `season`, `ep` params          |
+| `t=movie`           | Movie search                                  |
+| `t=music`, `t=book` | Music and book search                         |
+| Categories          | Full Torznab category tree (42 subcategories) |
+| Seeders/Peers       | Live counts from ext.to (unlike btdig)        |
 
 ### Magnet resolution
 
@@ -179,7 +182,7 @@ ext.to requires a two-step process for magnet links:
 1. **Search** returns metadata (title, size, seeders, category) with empty magnet
 2. **HMAC-signed API call** to `/ajax/getSearchMagnet.php` extracts the infohash
 3. **On-demand (`t=download`)** — when the initial search produces no magnet,
-   the *arr app calls back with the GUID and the bridge resolves the magnet via
+   the \*arr app calls back with the GUID and the bridge resolves the magnet via
    the detail-page API
 
 The HMAC is computed as `SHA256(torrent_id|timestamp|searchPageToken)` —
@@ -189,12 +192,10 @@ tokens are extracted from the page HTML and auto-refreshed when they expire.
 
 Add both bridges as separate Torznab indexers:
 
-| Indexer | URL |
-|---------|-----|
-| BTDig | `http://host:5555/torznab/api` |
-| ext.to | `http://host:5556/torznab/api` |
-
-
+| Indexer | URL                            |
+| ------- | ------------------------------ |
+| BTDig   | `http://host:5555/torznab/api` |
+| ext.to  | `http://host:5556/torznab/api` |
 
 ## License
 

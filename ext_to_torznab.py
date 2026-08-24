@@ -47,12 +47,34 @@ except ImportError:
 
 HOST = os.environ.get("EXT_TO_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EXT_TO_PORT", "5556"))
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST") or HOST
 EXT_TO_URL = os.environ.get("EXT_TO_URL", "https://ext.to")
 FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://localhost:8191")
 FLARESOLVERR_TIMEOUT = int(os.environ.get("FLARESOLVERR_TIMEOUT", "60000"))
 INCLUDE_ADULT = os.environ.get("INCLUDE_ADULT", "true").lower() == "true"
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 CACHE_TTL = int(os.environ.get("EXT_TO_CACHE_TTL", "300"))
+
+
+def _build_public_base_url(public_host: str, fallback_host: str, port: int) -> str:
+    """Return the URL the Torznab RSS should advertise to clients.
+
+    PUBLIC_HOST is the public address clients should use. When it is unset we
+    fall back to EXT_TO_HOST so existing setups keep working. If the value is a
+    bare hostname without scheme, default to HTTPS; bare host:port values keep
+    the existing scheme-less host:port form.
+    """
+    value = (public_host or fallback_host or "").strip()
+    if not value:
+        return f"http://{fallback_host}:{port}"
+    if "://" in value:
+        return value.rstrip("/")
+    if ":" in value and value.rsplit(":", 1)[1].isdigit():
+        return "http://" + value.rstrip("/")
+    return "https://" + value.rstrip("/")
+
+
+PUBLIC_BASE_URL = _build_public_base_url(PUBLIC_HOST, HOST, PORT)
 
 logger = logging.getLogger("ext.to")
 
@@ -483,7 +505,8 @@ class ExtToScraper:
 
     def search(self, query: str = "", categories: Optional[list[int]] = None,
                season: Optional[int] = None, episode: Optional[int] = None,
-               offset: int = 0, limit: int = 25) -> list[dict]:
+               offset: int = 0, limit: int = 25,
+               sort: str = "age", order: str = "desc") -> list[dict]:
         effective_query = query.strip()
         if effective_query and season is not None:
             if episode is not None:
@@ -505,7 +528,9 @@ class ExtToScraper:
         last_url = ""
 
         for page in range(start_page, start_page + pages_needed):
-            url = self._build_url(effective_query, page)
+            url = self._build_url(
+                effective_query, page, sort, order, categories
+            )
             logger.info("Fetching ext.to page %d: %s", page, url)
             try:
                 html, _cookies, _ua = self._fs.get_page_with_cookies(url)
@@ -580,8 +605,12 @@ class ExtToScraper:
         local_offset = offset % _RESULTS_PER_PAGE if offset > 0 else 0
         return all_results[local_offset:local_offset + limit]
 
-    def _build_url(self, query: str, page: int) -> str:
-        params: dict[str, str] = {"sort": "age", "order": "desc", "q": query}
+    def _build_url(self, query: str, page: int,
+                   sort: str = "age", order: str = "desc",
+                   categories: Optional[list[int]] = None) -> str:
+        params: dict[str, str] = {"sort": sort, "order": order, "q": query}
+        if categories:
+            params["cat"] = ",".join(str(c) for c in categories)
         if self._include_adult:
             params["with_adult"] = "1"
         if page > 1:
@@ -1003,7 +1032,24 @@ def _error_xml(msg: str) -> str:
 # ---------------------------------------------------------------------------
 
 _scraper: Optional[ExtToScraper] = None
-_server_base_url = f"http://{HOST}:{PORT}"
+_server_base_url = PUBLIC_BASE_URL
+
+
+def _sanitize_redirect_url(url: str) -> str:
+    if not url:
+        return url
+    value = url.strip()
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme == "magnet":
+        return value
+    if parsed.scheme in ("http", "https"):
+        return urllib.parse.urlunparse(
+            parsed._replace(
+                path=urllib.parse.quote(parsed.path, safe="/%"),
+                query=urllib.parse.quote(parsed.query, safe="=&?/%:@+,;"),
+            )
+        )
+    return urllib.parse.quote(value, safe="/:?&=%+;,@[]!$'()*~")
 
 
 class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
@@ -1033,6 +1079,8 @@ class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
             ep_s = params.get("ep", [None])[0]
             offset = int(params.get("offset", ["0"])[0])
             limit = min(int(params.get("limit", ["25"])[0]), 100)
+            sort = params.get("sort", ["age"])[0].strip() or "age"
+            order = params.get("order", ["desc"])[0].strip() or "desc"
 
             categories = []
             if cat:
@@ -1053,6 +1101,7 @@ class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
                     query=q, categories=categories or None,
                     season=season, episode=episode,
                     offset=offset, limit=limit,
+                    sort=sort, order=order,
                 )
             except FlareSolverrError as exc:
                 logger.error("FlareSolverr error: %s", exc)
@@ -1100,8 +1149,9 @@ class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(xml.encode("utf-8"))
 
     def _redirect(self, url: str):
+        safe_url = _sanitize_redirect_url(url)
         self.send_response(302)
-        self.send_header("Location", url)
+        self.send_header("Location", safe_url)
         self.end_headers()
 
     def _ok_plain(self, text: str):
@@ -1129,15 +1179,16 @@ def main():
     logger.info("═══ EXT Torrents Torznab proxy ═══")
     logger.info("FlareSolverr: %s", FLARESOLVERR_URL)
     logger.info("ext.to URL  : %s", EXT_TO_URL)
+    logger.info("Public URL  : %s", PUBLIC_BASE_URL)
     logger.info("Include adult: %s", INCLUDE_ADULT)
     logger.info("Listen: %s:%d", HOST, PORT)
 
     fs = FlareSolverrClient(FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT)
     _scraper = ExtToScraper(EXT_TO_URL, fs, INCLUDE_ADULT)
-    _server_base_url = f"http://{HOST}:{PORT}"
+    _server_base_url = PUBLIC_BASE_URL
 
     sv = http.server.HTTPServer((HOST, PORT), ExtTorznabHandler)
-    logger.info("Torznab endpoint: http://%s:%d/torznab/api", HOST, PORT)
+    logger.info("Torznab endpoint: %s/torznab/api", _server_base_url)
     try:
         sv.serve_forever()
     except KeyboardInterrupt:
