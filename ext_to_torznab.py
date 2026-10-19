@@ -1328,24 +1328,35 @@ class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
         )
 
     def _send(self, xml: str, status: int = 200):
-        self.send_response(status)
-        self.send_header("Content-Type",
-                         "application/rss+xml; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(xml.encode("utf-8"))
+        try:
+            self.send_response(status)
+            self.send_header(
+                "Content-Type", "application/rss+xml; charset=utf-8"
+            )
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(xml.encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The Torznab client gave up (usually its own scrape timeout).
+            logger.debug("Client disconnected before response was sent")
 
     def _redirect(self, url: str):
         safe_url = _sanitize_redirect_url(url)
-        self.send_response(302)
-        self.send_header("Location", safe_url)
-        self.end_headers()
+        try:
+            self.send_response(302)
+            self.send_header("Location", safe_url)
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            logger.debug("Client disconnected before redirect was sent")
 
     def _ok_plain(self, text: str):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(text.encode())
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(text.encode())
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            logger.debug("Client disconnected before response was sent")
 
     def log_message(self, fmt, *args):
         logger.info("%s - %s %s", self.client_address[0], args[0], args[1])
