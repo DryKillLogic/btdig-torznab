@@ -27,7 +27,7 @@ import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -100,7 +100,9 @@ _TRACKERS = [
 _RESULTS_PER_PAGE = 50
 _MAGNET_API_PATH = "/ajax/getSearchMagnet.php"
 _DETAIL_MAGNET_API_PATH = "/ajax/getTorrentMagnet.php"
-_MAGNET_WORKERS = 3
+# FlareSolverr sessions own one browser context each. Operations borrow a
+# session for their whole lifetime so concurrent requests never share one.
+FLARESOLVERR_SESSIONS = int(os.environ.get("EXT_TO_FLARESOLVERR_SESSIONS", "2"))
 
 # Pre-compiled regex patterns
 _RE_HTML_TAGS = re.compile(r"<[^>]+>")
@@ -345,12 +347,16 @@ class FlareSolverrError(Exception):
 class FlareSolverrClient:
     """Thin wrapper around the FlareSolverr REST API v1."""
 
-    def __init__(self, base_url: str, timeout_ms: int = 60000):
+    def __init__(self, base_url: str, timeout_ms: int = 60000,
+                 max_sessions: Optional[int] = None):
         self._api_url = base_url.rstrip("/") + "/v1"
         self._timeout_ms = timeout_ms
         self._http_timeout = timeout_ms / 1000 + 15
-        self._session_id: Optional[str] = None
-        self._session_lock = threading.Lock()
+        self._max_sessions = max(1, max_sessions or FLARESOLVERR_SESSIONS)
+        self._session_slots = threading.BoundedSemaphore(self._max_sessions)
+        self._free_sessions: list[str] = []
+        self._all_sessions: set[str] = set()
+        self._sessions_lock = threading.Lock()
         self._failure_count = 0
         self._open_until = 0.0
         self._breaker_lock = threading.Lock()
@@ -360,30 +366,69 @@ class FlareSolverrClient:
                 "Missing 'requests' library. Install with: pip install requests"
             )
 
-    def create_session(self) -> str:
-        with self._session_lock:
-            if self._session_id:
-                return self._session_id
-            result = self._post({"cmd": "sessions.create"})
-            session_id = result.get("session")
-            if not session_id:
-                self._record_failure()
-                raise FlareSolverrError(
-                    "FlareSolverr did not return a session ID"
-                )
-            self._session_id = session_id
-            logger.info("FlareSolverr session created: %s", session_id)
-            return session_id
+    def _create_session(self) -> str:
+        result = self._post({"cmd": "sessions.create"})
+        session_id = result.get("session")
+        if not session_id:
+            self._record_failure()
+            raise FlareSolverrError(
+                "FlareSolverr did not return a session ID"
+            )
+        with self._sessions_lock:
+            self._all_sessions.add(session_id)
+        logger.info("FlareSolverr session created: %s", session_id)
+        return session_id
 
-    def destroy_session(self) -> None:
-        if not self._session_id:
-            return
-        sid = self._session_id
-        self._session_id = None
+    def _acquire_session(self) -> str:
+        self._session_slots.acquire()
         try:
-            self._post({"cmd": "sessions.destroy", "session": sid})
-        except FlareSolverrError:
-            pass
+            with self._sessions_lock:
+                if self._free_sessions:
+                    return self._free_sessions.pop()
+            return self._create_session()
+        except BaseException:
+            self._session_slots.release()
+            raise
+
+    def _release_session(self, session_id: str, healthy: bool) -> None:
+        if healthy and session_id:
+            with self._sessions_lock:
+                self._free_sessions.append(session_id)
+            self._session_slots.release()
+            return
+
+        with self._sessions_lock:
+            self._all_sessions.discard(session_id)
+        self._session_slots.release()
+        if session_id:
+            try:
+                self._post({"cmd": "sessions.destroy", "session": session_id})
+            except FlareSolverrError:
+                pass
+
+    @contextmanager
+    def operation(self):
+        """Borrow one session for a multi-request scrape/resolve operation."""
+        session_id = self._acquire_session()
+        healthy = True
+        try:
+            yield session_id
+        except BaseException:
+            healthy = False
+            raise
+        finally:
+            self._release_session(session_id, healthy)
+
+    def destroy_all_sessions(self) -> None:
+        with self._sessions_lock:
+            sessions = list(self._all_sessions)
+            self._all_sessions.clear()
+            self._free_sessions.clear()
+        for session_id in sessions:
+            try:
+                self._post({"cmd": "sessions.destroy", "session": session_id})
+            except FlareSolverrError:
+                pass
 
     def _ensure_closed(self) -> None:
         with self._breaker_lock:
@@ -409,25 +454,31 @@ class FlareSolverrClient:
                     FLARESOLVERR_COOLDOWN,
                 )
 
-    def get_page(self, url: str) -> str:
-        html, _cookies, _ua = self.get_page_with_cookies(url)
+    def get_page(self, url: str, session: Optional[str] = None) -> str:
+        html, _cookies, _ua = self.get_page_with_cookies(url, session)
         return html
 
-    def get_page_with_cookies(self, url: str) -> tuple[str, dict, str]:
-        if not self._session_id:
-            self.create_session()
-        return self._do_request("request.get", url)
+    def get_page_with_cookies(self, url: str,
+                              session: Optional[str] = None) -> tuple[str, dict, str]:
+        if session is None:
+            with self.operation() as owned:
+                return self._do_request("request.get", url, owned)
+        return self._do_request("request.get", url, session)
 
-    def post_form(self, url: str, post_data: str) -> dict:
-        if not self._session_id:
-            self.create_session()
+    def post_form(self, url: str, post_data: str,
+                  session: Optional[str] = None) -> dict:
+        if session is None:
+            with self.operation() as owned:
+                return self._post_form_once(url, post_data, owned)
+        return self._post_form_once(url, post_data, session)
 
+    def _post_form_once(self, url: str, post_data: str, session: str) -> dict:
         payload = {
             "cmd": "request.post",
             "url": url,
             "postData": post_data,
             "maxTimeout": self._timeout_ms,
-            "session": self._session_id,
+            "session": session,
         }
 
         result = self._post(payload)
@@ -458,15 +509,18 @@ class FlareSolverrClient:
         except json.JSONDecodeError:
             self._record_failure()
             return {"success": False, "error": "Non-JSON response"}
+        if isinstance(parsed, dict) and parsed.get("error") == "Invalid session":
+            raise FlareSolverrError("FlareSolverr session invalid")
         self._record_success()
         return parsed
 
-    def _do_request(self, cmd: str, url: str) -> tuple[str, dict, str]:
+    def _do_request(self, cmd: str, url: str,
+                    session: str) -> tuple[str, dict, str]:
         payload = {
             "cmd": cmd,
             "url": url,
             "maxTimeout": self._timeout_ms,
-            "session": self._session_id,
+            "session": session,
         }
         result = self._post(payload)
         status = result.get("status")
@@ -486,6 +540,8 @@ class FlareSolverrClient:
             )
 
         html = solution.get("response", "")
+        if "Invalid session" in html:
+            raise FlareSolverrError("FlareSolverr session invalid")
         ua = solution.get("userAgent", "")
         cookies: dict = {}
         for c in solution.get("cookies", []):
@@ -588,13 +644,17 @@ class ExtToScraper:
                 logger.debug("Search cache hit: %r", effective_query)
                 return [dict(item) for item in cached[1]]
 
-        # Keywordless → browse category pages to avoid 522
-        if not effective_query:
-            results = self._browse_by_categories(categories or [], offset, limit)
-        else:
-            results = self._search_pages(
-                effective_query, categories, offset, limit, sort, order
-            )
+        with self._fs.operation() as session:
+            # Keywordless → browse category pages to avoid 522
+            if not effective_query:
+                results = self._browse_by_categories(
+                    categories or [], offset, limit, session
+                )
+            else:
+                results = self._search_pages(
+                    effective_query, categories, offset, limit, sort, order,
+                    session,
+                )
 
         # Empty results are cached briefly so an outage doesn't hammer ext.to,
         # while still allowing a quick recovery.
@@ -610,7 +670,8 @@ class ExtToScraper:
     def _search_pages(self, effective_query: str,
                       categories: Optional[list[int]],
                       offset: int, limit: int,
-                      sort: str, order: str) -> list[dict]:
+                      sort: str, order: str,
+                      session: str) -> list[dict]:
         start_page = (offset // _RESULTS_PER_PAGE) + 1
         pages_needed = max(1, -(-limit // _RESULTS_PER_PAGE))
 
@@ -624,7 +685,9 @@ class ExtToScraper:
             )
             logger.info("Fetching ext.to page %d: %s", page, url)
             try:
-                html, _cookies, _ua = self._fs.get_page_with_cookies(url)
+                html, _cookies, _ua = self._fs.get_page_with_cookies(
+                    url, session
+                )
             except FlareSolverrError as exc:
                 logger.error("FlareSolverr error: %s", exc)
                 break
@@ -639,13 +702,15 @@ class ExtToScraper:
 
         # Enrich with magnets
         if last_html and all_results:
-            self._enrich_with_magnets(all_results, last_url, last_html)
+            self._enrich_with_magnets(
+                all_results, last_url, last_html, session
+            )
 
         local_offset = offset % _RESULTS_PER_PAGE if offset > 0 else 0
         return all_results[local_offset:local_offset + limit]
 
     def _browse_by_categories(self, categories: list[int], offset: int,
-                               limit: int) -> list[dict]:
+                               limit: int, session: str) -> list[dict]:
         paths_seen: set = set()
         browse_paths: list[str] = []
         for cat in (categories or []):
@@ -671,7 +736,9 @@ class ExtToScraper:
                 url += f"?page={page_param}"
             logger.info("Keywordless browse: %s", url)
             try:
-                html, _cookies, _ua = self._fs.get_page_with_cookies(url)
+                html, _cookies, _ua = self._fs.get_page_with_cookies(
+                    url, session
+                )
             except FlareSolverrError as exc:
                 logger.error("FlareSolverr error browsing %s: %s", path, exc)
                 continue
@@ -691,7 +758,9 @@ class ExtToScraper:
             ]
 
         if last_html and all_results:
-            self._enrich_with_magnets(all_results, last_url, last_html)
+            self._enrich_with_magnets(
+                all_results, last_url, last_html, session
+            )
 
         local_offset = offset % _RESULTS_PER_PAGE if offset > 0 else 0
         return all_results[local_offset:local_offset + limit]
@@ -849,7 +918,7 @@ class ExtToScraper:
     # -------------------------------------------------------------------
 
     def _enrich_with_magnets(self, results: list[dict], page_url: str,
-                              page_html: str) -> None:
+                              page_html: str, session: str) -> None:
         page_token, csrf_token = _extract_js_tokens(page_html)
         if not page_token or not csrf_token:
             logger.warning(
@@ -869,7 +938,7 @@ class ExtToScraper:
             with token_lock:
                 if refresh_done.is_set():
                     return
-                new_tok, new_csrf = self._fetch_fresh_tokens(page_url)
+                new_tok, new_csrf = self._fetch_fresh_tokens(page_url, session)
                 if new_tok and new_csrf:
                     token_state["page_token"] = new_tok
                     token_state["csrf_token"] = new_csrf
@@ -882,7 +951,7 @@ class ExtToScraper:
             tok, csrf = _get_tokens()
             try:
                 data = self._fs.post_form(
-                    api_url, _build_magnet_post(tid, tok, csrf)
+                    api_url, _build_magnet_post(tid, tok, csrf), session
                 )
             except FlareSolverrError as exc:
                 logger.debug("Magnet API error id=%s: %s", tid, exc)
@@ -897,7 +966,7 @@ class ExtToScraper:
                     return
                 try:
                     data = self._fs.post_form(
-                        api_url, _build_magnet_post(tid, tok, csrf)
+                        api_url, _build_magnet_post(tid, tok, csrf), session
                     )
                 except FlareSolverrError as exc:
                     logger.debug("Magnet retry error id=%s: %s", tid, exc)
@@ -922,8 +991,10 @@ class ExtToScraper:
                 if infohash:
                     item["guid"] = f"https://ext.to/t/{infohash}/"
 
-        with ThreadPoolExecutor(max_workers=_MAGNET_WORKERS) as pool:
-            pool.map(fetch_one, results)
+        # The operation owns one FlareSolverr session, so requests must be
+        # sequential; concurrent POSTs on a session return each other's data.
+        for item in results:
+            fetch_one(item)
 
         success_count = sum(1 for r in results if r.get("magnet_url"))
         logger.info("Fetched %d/%d magnet links", success_count, len(results))
@@ -936,9 +1007,12 @@ class ExtToScraper:
                                  "hmac", "auth", "forbidden", "blocked")
         )
 
-    def _fetch_fresh_tokens(self, page_url: str) -> tuple[str, str]:
+    def _fetch_fresh_tokens(self, page_url: str,
+                            session: str) -> tuple[str, str]:
         try:
-            html, _cookies, _ua = self._fs.get_page_with_cookies(page_url)
+            html, _cookies, _ua = self._fs.get_page_with_cookies(
+                page_url, session
+            )
         except FlareSolverrError as exc:
             logger.debug("Token refresh failed: %s", exc)
             return "", ""
@@ -968,7 +1042,8 @@ class ExtToScraper:
                 logger.debug("Magnet cache hit: %s", guid)
                 return cached[1]
 
-        magnet = self._resolve_magnet_uncached(guid)
+        with self._fs.operation() as session:
+            magnet = self._resolve_magnet_uncached(guid, session)
 
         # Magnets are immutable; failures are cached briefly so clients that
         # retry aggressively don't stampede FlareSolverr during an outage.
@@ -978,10 +1053,13 @@ class ExtToScraper:
             self._trim_cache(self._magnet_cache, max_entries=4096)
         return magnet
 
-    def _resolve_magnet_uncached(self, guid: str) -> Optional[str]:
+    def _resolve_magnet_uncached(self, guid: str,
+                                 session: str) -> Optional[str]:
         logger.info("t=download: fetching detail page %s", guid)
         try:
-            html, _cookies, _ua = self._fs.get_page_with_cookies(guid)
+            html, _cookies, _ua = self._fs.get_page_with_cookies(
+                guid, session
+            )
         except FlareSolverrError as exc:
             logger.error("t=download: page fetch failed: %s", exc)
             return None
@@ -1018,7 +1096,7 @@ class ExtToScraper:
         for api_path in (_DETAIL_MAGNET_API_PATH, _MAGNET_API_PATH):
             api_url = self._base + api_path
             try:
-                data = self._fs.post_form(api_url, post_data)
+                data = self._fs.post_form(api_url, post_data, session)
             except FlareSolverrError:
                 continue
 
@@ -1304,7 +1382,7 @@ def main():
         sv.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
-        fs.destroy_session()
+        fs.destroy_all_sessions()
         sv.shutdown()
 
 

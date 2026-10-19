@@ -155,6 +155,7 @@ python3 ext_to_torznab.py
 | `EXT_TO_URL`           | `https://ext.to`        | ext.to base URL                                                                                   |
 | `FLARESOLVERR_URL`     | `http://localhost:8191` | FlareSolverr endpoint                                                                             |
 | `FLARESOLVERR_TIMEOUT` | `60000`                 | FlareSolverr timeout (ms)                                                                         |
+| `EXT_TO_FLARESOLVERR_SESSIONS` | `2`             | Concurrent FlareSolverr browser sessions (one per scrape/resolve operation)                       |
 | `INCLUDE_ADULT`        | `true`                  | Include adult (XXX) content                                                                       |
 | `LOG_LEVEL`            | `INFO`                  | Log level (DEBUG, INFO, WARNING)                                                                  |
 | `EXT_TO_CACHE_TTL`     | `300`                   | Search result cache TTL in seconds                                                                |

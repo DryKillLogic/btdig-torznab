@@ -8,6 +8,7 @@ They test the pure functions and parser logic with sample HTML/data.
 
 import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
@@ -422,11 +423,15 @@ class _FakeFlareSolverr:
         self.get_calls = 0
         self.post_calls = 0
 
-    def get_page_with_cookies(self, url):
+    @contextmanager
+    def operation(self):
+        yield "fake-session"
+
+    def get_page_with_cookies(self, url, session=None):
         self.get_calls += 1
         return self.html, {}, ""
 
-    def post_form(self, url, post_data):
+    def post_form(self, url, post_data, session=None):
         self.post_calls += 1
         return self.post_result
 
@@ -487,6 +492,27 @@ class TestCaching(unittest.TestCase):
                 fs.get_page("https://ext.to")
 
         self.assertEqual(post.call_count, 2)
+
+    def test_operation_pool_uses_and_reuses_sessions(self):
+        class _PoolClient(ext.FlareSolverrClient):
+            def __init__(self):
+                super().__init__("http://fs.test", max_sessions=2)
+                self.created = []
+
+            def _post(self, payload):
+                session_id = f"s{len(self.created)}"
+                self.created.append(session_id)
+                return {"session": session_id}
+
+        client = _PoolClient()
+        with client.operation() as first:
+            with client.operation() as second:
+                self.assertNotEqual(first, second)
+        self.assertEqual(sorted(client.created), ["s0", "s1"])
+
+        with client.operation() as reused:
+            self.assertIn(reused, {first, second})
+        self.assertEqual(len(client.created), 2)
 
 
 # ---------------------------------------------------------------------------
