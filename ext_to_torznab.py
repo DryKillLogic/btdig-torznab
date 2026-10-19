@@ -54,6 +54,12 @@ FLARESOLVERR_TIMEOUT = int(os.environ.get("FLARESOLVERR_TIMEOUT", "60000"))
 INCLUDE_ADULT = os.environ.get("INCLUDE_ADULT", "true").lower() == "true"
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 CACHE_TTL = int(os.environ.get("EXT_TO_CACHE_TTL", "300"))
+MAGNET_CACHE_TTL = int(os.environ.get("EXT_TO_MAGNET_CACHE_TTL", "21600"))
+NEGATIVE_CACHE_TTL = int(os.environ.get("EXT_TO_NEGATIVE_CACHE_TTL", "60"))
+FLARESOLVERR_FAILURE_THRESHOLD = int(
+    os.environ.get("EXT_TO_FAILURE_THRESHOLD", "5")
+)
+FLARESOLVERR_COOLDOWN = int(os.environ.get("EXT_TO_COOLDOWN", "30"))
 
 
 def _build_public_base_url(public_host: str, fallback_host: str, port: int) -> str:
@@ -345,6 +351,9 @@ class FlareSolverrClient:
         self._http_timeout = timeout_ms / 1000 + 15
         self._session_id: Optional[str] = None
         self._session_lock = threading.Lock()
+        self._failure_count = 0
+        self._open_until = 0.0
+        self._breaker_lock = threading.Lock()
 
         if requests is None:
             raise RuntimeError(
@@ -358,6 +367,7 @@ class FlareSolverrClient:
             result = self._post({"cmd": "sessions.create"})
             session_id = result.get("session")
             if not session_id:
+                self._record_failure()
                 raise FlareSolverrError(
                     "FlareSolverr did not return a session ID"
                 )
@@ -374,6 +384,30 @@ class FlareSolverrClient:
             self._post({"cmd": "sessions.destroy", "session": sid})
         except FlareSolverrError:
             pass
+
+    def _ensure_closed(self) -> None:
+        with self._breaker_lock:
+            if time.time() < self._open_until:
+                raise FlareSolverrError(
+                    "FlareSolverr circuit open; retry in "
+                    f"{self._open_until - time.time():.0f}s"
+                )
+
+    def _record_success(self) -> None:
+        with self._breaker_lock:
+            self._failure_count = 0
+            self._open_until = 0.0
+
+    def _record_failure(self) -> None:
+        with self._breaker_lock:
+            self._failure_count += 1
+            if self._failure_count >= FLARESOLVERR_FAILURE_THRESHOLD:
+                self._open_until = time.time() + FLARESOLVERR_COOLDOWN
+                self._failure_count = 0
+                logger.warning(
+                    "FlareSolverr circuit opened for %ss after repeated failures",
+                    FLARESOLVERR_COOLDOWN,
+                )
 
     def get_page(self, url: str) -> str:
         html, _cookies, _ua = self.get_page_with_cookies(url)
@@ -399,6 +433,7 @@ class FlareSolverrClient:
         result = self._post(payload)
         status = result.get("status")
         if status != "ok":
+            self._record_failure()
             msg = result.get("message", "Unknown error")
             raise FlareSolverrError(
                 f"FlareSolverr POST returned status={status!r}: {msg}"
@@ -407,6 +442,7 @@ class FlareSolverrClient:
         solution = result.get("solution", {})
         http_status = solution.get("status", 200)
         if http_status >= 400:
+            self._record_failure()
             raise FlareSolverrError(
                 f"POST to {url} returned HTTP {http_status}"
             )
@@ -418,9 +454,12 @@ class FlareSolverrClient:
             raw = m.group(1).strip()
 
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return {"success": False, "error": f"Non-JSON response"}
+            self._record_failure()
+            return {"success": False, "error": "Non-JSON response"}
+        self._record_success()
+        return parsed
 
     def _do_request(self, cmd: str, url: str) -> tuple[str, dict, str]:
         payload = {
@@ -432,6 +471,7 @@ class FlareSolverrClient:
         result = self._post(payload)
         status = result.get("status")
         if status != "ok":
+            self._record_failure()
             msg = result.get("message", "Unknown error")
             raise FlareSolverrError(
                 f"FlareSolverr returned status={status!r}: {msg}"
@@ -440,6 +480,7 @@ class FlareSolverrClient:
         solution = result.get("solution", {})
         http_status = solution.get("status", 200)
         if http_status >= 400:
+            self._record_failure()
             raise FlareSolverrError(
                 f"ext.to returned HTTP {http_status} for {url}"
             )
@@ -453,9 +494,11 @@ class FlareSolverrClient:
             if name:
                 cookies[name] = value
 
+        self._record_success()
         return html, cookies, ua
 
     def _post(self, payload: dict) -> dict:
+        self._ensure_closed()
         try:
             resp = requests.post(
                 self._api_url,
@@ -464,17 +507,22 @@ class FlareSolverrClient:
                 timeout=self._http_timeout,
             )
             resp.raise_for_status()
-            return resp.json()
+            result = resp.json()
+            self._record_success()
+            return result
         except requests.exceptions.ConnectionError as exc:
+            self._record_failure()
             raise FlareSolverrError(
                 f"Cannot connect to FlareSolverr at {self._api_url}: {exc}"
             )
         except requests.exceptions.Timeout as exc:
+            self._record_failure()
             raise FlareSolverrError(
                 f"FlareSolverr request timed out after "
                 f"{self._http_timeout:.0f}s"
             )
         except requests.exceptions.HTTPError as exc:
+            self._record_failure()
             raise FlareSolverrError(
                 f"FlareSolverr HTTP error: "
                 f"{exc.response.status_code} {exc.response.text[:200]}"
@@ -494,7 +542,8 @@ class ExtToScraper:
         self._base = base_url.rstrip("/")
         self._fs = flaresolverr
         self._include_adult = include_adult
-        self._cache: dict[str, tuple[list[dict], float]] = {}
+        self._search_cache: dict[tuple, tuple[float, list[dict]]] = {}
+        self._magnet_cache: dict[str, tuple[float, Optional[str]]] = {}
         self._cache_lock = threading.Lock()
 
         if BeautifulSoup is None:
@@ -502,6 +551,16 @@ class ExtToScraper:
                 "Missing 'beautifulsoup4' library. "
                 "Install with: pip install beautifulsoup4"
             )
+
+    @staticmethod
+    def _trim_cache(cache: dict, max_entries: int) -> None:
+        if len(cache) <= max_entries:
+            return
+        overflow = len(cache) - max_entries
+        for key, _ in sorted(
+            cache.items(), key=lambda item: item[1][0]
+        )[:overflow]:
+            cache.pop(key, None)
 
     def search(self, query: str = "", categories: Optional[list[int]] = None,
                season: Optional[int] = None, episode: Optional[int] = None,
@@ -514,12 +573,44 @@ class ExtToScraper:
             else:
                 effective_query = f"{effective_query} S{season:02d}"
 
+        cache_key = (
+            effective_query,
+            tuple(categories or ()),
+            offset,
+            limit,
+            sort,
+            order,
+        )
+        now = time.time()
+        with self._cache_lock:
+            cached = self._search_cache.get(cache_key)
+            if cached is not None and now < cached[0]:
+                logger.debug("Search cache hit: %r", effective_query)
+                return [dict(item) for item in cached[1]]
+
         # Keywordless → browse category pages to avoid 522
         if not effective_query:
-            return self._browse_by_categories(
-                categories or [], offset, limit
+            results = self._browse_by_categories(categories or [], offset, limit)
+        else:
+            results = self._search_pages(
+                effective_query, categories, offset, limit, sort, order
             )
 
+        # Empty results are cached briefly so an outage doesn't hammer ext.to,
+        # while still allowing a quick recovery.
+        ttl = CACHE_TTL if results else min(CACHE_TTL, 30)
+        with self._cache_lock:
+            self._search_cache[cache_key] = (
+                time.time() + ttl,
+                [dict(item) for item in results],
+            )
+            self._trim_cache(self._search_cache, max_entries=256)
+        return results
+
+    def _search_pages(self, effective_query: str,
+                      categories: Optional[list[int]],
+                      offset: int, limit: int,
+                      sort: str, order: str) -> list[dict]:
         start_page = (offset // _RESULTS_PER_PAGE) + 1
         pages_needed = max(1, -(-limit // _RESULTS_PER_PAGE))
 
@@ -870,6 +961,24 @@ class ExtToScraper:
         if not guid.startswith("http"):
             return None
 
+        now = time.time()
+        with self._cache_lock:
+            cached = self._magnet_cache.get(guid)
+            if cached is not None and now < cached[0]:
+                logger.debug("Magnet cache hit: %s", guid)
+                return cached[1]
+
+        magnet = self._resolve_magnet_uncached(guid)
+
+        # Magnets are immutable; failures are cached briefly so clients that
+        # retry aggressively don't stampede FlareSolverr during an outage.
+        ttl = MAGNET_CACHE_TTL if magnet else NEGATIVE_CACHE_TTL
+        with self._cache_lock:
+            self._magnet_cache[guid] = (time.time() + ttl, magnet)
+            self._trim_cache(self._magnet_cache, max_entries=4096)
+        return magnet
+
+    def _resolve_magnet_uncached(self, guid: str) -> Optional[str]:
         logger.info("t=download: fetching detail page %s", guid)
         try:
             html, _cookies, _ua = self._fs.get_page_with_cookies(guid)
@@ -1187,7 +1296,9 @@ def main():
     _scraper = ExtToScraper(EXT_TO_URL, fs, INCLUDE_ADULT)
     _server_base_url = PUBLIC_BASE_URL
 
-    sv = http.server.HTTPServer((HOST, PORT), ExtTorznabHandler)
+    # Threaded: a slow t=download resolution must not block searches.
+    sv = http.server.ThreadingHTTPServer((HOST, PORT), ExtTorznabHandler)
+    sv.daemon_threads = True
     logger.info("Torznab endpoint: %s/torznab/api", _server_base_url)
     try:
         sv.serve_forever()

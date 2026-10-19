@@ -157,7 +157,11 @@ python3 ext_to_torznab.py
 | `FLARESOLVERR_TIMEOUT` | `60000`                 | FlareSolverr timeout (ms)                                                                         |
 | `INCLUDE_ADULT`        | `true`                  | Include adult (XXX) content                                                                       |
 | `LOG_LEVEL`            | `INFO`                  | Log level (DEBUG, INFO, WARNING)                                                                  |
-| `EXT_TO_CACHE_TTL`     | `300`                   | Cache TTL in seconds                                                                              |
+| `EXT_TO_CACHE_TTL`     | `300`                   | Search result cache TTL in seconds                                                                |
+| `EXT_TO_MAGNET_CACHE_TTL` | `21600`              | Resolved magnet cache TTL in seconds                                                              |
+| `EXT_TO_NEGATIVE_CACHE_TTL` | `60`               | Failed magnet resolution cache TTL in seconds                                                     |
+| `EXT_TO_FAILURE_THRESHOLD` | `5`                 | Consecutive FlareSolverr failures before the circuit opens                                        |
+| `EXT_TO_COOLDOWN`      | `30`                    | Seconds the FlareSolverr circuit stays open                                                       |
 
 When `PUBLIC_HOST` is not set, the bridge reuses `EXT_TO_HOST` as the public-facing host. Keep the bind host local (for example `0.0.0.0:5556`) and set `PUBLIC_HOST` to the public hostname only when you need the Torznab feed to advertise a production URL instead of the bind address.
 
@@ -187,6 +191,12 @@ ext.to requires a two-step process for magnet links:
 
 The HMAC is computed as `SHA256(torrent_id|timestamp|searchPageToken)` —
 tokens are extracted from the page HTML and auto-refreshed when they expire.
+
+Search results and resolved magnets are cached (`EXT_TO_CACHE_TTL` and
+`EXT_TO_MAGNET_CACHE_TTL`), and the HTTP server is threaded, so a slow
+`t=download` does not block concurrent searches. After
+`EXT_TO_FAILURE_THRESHOLD` consecutive FlareSolverr failures the bridge opens a
+circuit for `EXT_TO_COOLDOWN` seconds instead of queueing more requests.
 
 ### Adding to Sonarr as a second indexer
 

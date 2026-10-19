@@ -8,6 +8,7 @@ They test the pure functions and parser logic with sample HTML/data.
 
 import time
 import unittest
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 # Import the module under test
@@ -403,6 +404,89 @@ class TestRssBuilder(unittest.TestCase):
         xml = ext._error_xml("Something broke")
         self.assertIn("Something broke", xml)
         self.assertIn("Error", xml)
+
+
+# ---------------------------------------------------------------------------
+# Tests — caching and resilience
+# ---------------------------------------------------------------------------
+
+
+class _FakeFlareSolverr:
+    def __init__(self, html, post_result=None):
+        self.html = html
+        self.post_result = post_result or {
+            "success": True,
+            "hash": "a" * 40,
+            "url": "",
+        }
+        self.get_calls = 0
+        self.post_calls = 0
+
+    def get_page_with_cookies(self, url):
+        self.get_calls += 1
+        return self.html, {}, ""
+
+    def post_form(self, url, post_data):
+        self.post_calls += 1
+        return self.post_result
+
+
+class TestCaching(unittest.TestCase):
+    def test_search_results_are_cached(self):
+        fs = _FakeFlareSolverr(SAMPLE_PAGE_HTML)
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        first = scraper.search("Test", limit=10)
+        second = scraper.search("Test", limit=10)
+
+        self.assertEqual(first, second)
+        self.assertEqual(fs.get_calls, 1)
+        self.assertEqual(fs.post_calls, 1)
+
+    def test_magnet_resolution_is_cached(self):
+        fs = _FakeFlareSolverr(SAMPLE_DETAIL_PAGE)
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+        guid = "https://ext.to/some-release-123/"
+
+        first = scraper.fetch_magnet_for_guid(guid)
+        second = scraper.fetch_magnet_for_guid(guid)
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertEqual(fs.get_calls, 1)
+        self.assertEqual(fs.post_calls, 1)
+
+    def test_failed_magnet_resolution_is_negatively_cached(self):
+        fs = _FakeFlareSolverr(
+            SAMPLE_DETAIL_PAGE,
+            post_result={"success": False, "error": "nope"},
+        )
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+        guid = "https://ext.to/some-release-123/"
+
+        self.assertIsNone(scraper.fetch_magnet_for_guid(guid))
+        self.assertIsNone(scraper.fetch_magnet_for_guid(guid))
+
+        # First call tries both API paths; the repeat hits the negative cache.
+        self.assertEqual(fs.get_calls, 1)
+        self.assertEqual(fs.post_calls, 2)
+
+    def test_flaresolverr_circuit_opens_after_consecutive_failures(self):
+        fs = ext.FlareSolverrClient("http://fs.test")
+
+        with (
+            patch.object(ext.requests, "post") as post,
+            patch.object(ext, "FLARESOLVERR_FAILURE_THRESHOLD", 2),
+            patch.object(ext, "FLARESOLVERR_COOLDOWN", 60),
+        ):
+            post.side_effect = ext.requests.exceptions.ConnectionError("down")
+            for _ in range(2):
+                with self.assertRaises(ext.FlareSolverrError):
+                    fs.get_page("https://ext.to")
+            with self.assertRaisesRegex(ext.FlareSolverrError, "circuit open"):
+                fs.get_page("https://ext.to")
+
+        self.assertEqual(post.call_count, 2)
 
 
 # ---------------------------------------------------------------------------
