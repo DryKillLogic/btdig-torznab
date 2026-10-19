@@ -163,6 +163,7 @@ python3 ext_to_torznab.py
 | `EXT_TO_NEGATIVE_CACHE_TTL` | `60`               | Failed magnet resolution cache TTL in seconds                                                     |
 | `EXT_TO_FAILURE_THRESHOLD` | `5`                 | Consecutive FlareSolverr failures before the circuit opens                                        |
 | `EXT_TO_COOLDOWN`      | `30`                    | Seconds the FlareSolverr circuit stays open                                                       |
+| `EXT_TO_ENRICH_LIMIT`  | `20`                    | Max results enriched with magnets per search (`0` = no limit)                                     |
 
 When `PUBLIC_HOST` is not set, the bridge reuses `EXT_TO_HOST` as the public-facing host. Keep the bind host local (for example `0.0.0.0:5556`) and set `PUBLIC_HOST` to the public hostname only when you need the Torznab feed to advertise a production URL instead of the bind address.
 

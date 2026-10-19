@@ -60,6 +60,9 @@ FLARESOLVERR_FAILURE_THRESHOLD = int(
     os.environ.get("EXT_TO_FAILURE_THRESHOLD", "5")
 )
 FLARESOLVERR_COOLDOWN = int(os.environ.get("EXT_TO_COOLDOWN", "30"))
+# Enrich only the top results; clients can resolve the rest on demand.
+# 0 disables the limit.
+ENRICH_LIMIT = int(os.environ.get("EXT_TO_ENRICH_LIMIT", "20"))
 
 
 def _build_public_base_url(public_host: str, fallback_host: str, port: int) -> str:
@@ -997,11 +1000,15 @@ class ExtToScraper:
 
         # The operation owns one FlareSolverr session, so requests must be
         # sequential; concurrent POSTs on a session return each other's data.
-        for item in results:
+        targets = results[:ENRICH_LIMIT] if ENRICH_LIMIT > 0 else results
+        for item in targets:
             fetch_one(item)
 
         success_count = sum(1 for r in results if r.get("magnet_url"))
-        logger.info("Fetched %d/%d magnet links", success_count, len(results))
+        logger.info(
+            "Fetched %d/%d magnet links (enriched %d)",
+            success_count, len(results), len(targets),
+        )
 
     @staticmethod
     def _looks_like_token_error(data: dict) -> bool:
