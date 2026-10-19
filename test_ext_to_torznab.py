@@ -203,9 +203,20 @@ class TestHelpers(unittest.TestCase):
             "https://ext.myserver.stream",
         )
 
+    def test_sanitize_redirect_url_encodes_unicode_magnet(self):
+        magnet = "magnet:?xt=urn:btih:abc&dn=ワンピース 第107巻"
+
+        sanitized = ext._sanitize_redirect_url(magnet)
+
+        sanitized.encode("latin-1")  # must be header-safe
+        self.assertIn("%E3%83%AF", sanitized)
+        self.assertTrue(sanitized.startswith("magnet:?xt=urn:btih:abc&dn="))
+
     def test_sanitize_redirect_url_ascii_safe(self):
         url = "magnet:?xt=urn:btih:ABCDEF&dn=⭐+Test+Title"
-        self.assertEqual(ext._sanitize_redirect_url(url), url)
+        sanitized = ext._sanitize_redirect_url(url)
+        sanitized.encode("latin-1")  # must be header-safe
+        self.assertIn("%E2%AD%90", sanitized)
         http_url = "https://ext.to/download/⭐/title"
         self.assertIn("%E2%AD%90", ext._sanitize_redirect_url(http_url))
 
@@ -306,6 +317,12 @@ class TestHtmlParser(unittest.TestCase):
 
     def test_parse_no_table(self):
         results = self.scraper._parse_html("<html><body>no results</body></html>")
+        self.assertEqual(results, [])
+
+    def test_parse_no_results_marker(self):
+        results = self.scraper._parse_html(
+            "<html><body><p>No results found.</p></body></html>"
+        )
         self.assertEqual(results, [])
 
     def test_cat_id_via_related_posted(self):

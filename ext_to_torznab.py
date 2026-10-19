@@ -785,6 +785,10 @@ class ExtToScraper:
             logger.warning("ext.to returned a Cloudflare error page")
             return []
 
+        if "No results" in html:
+            logger.debug("ext.to returned no results for this query")
+            return []
+
         soup = BeautifulSoup(html, "html.parser")
         table = soup.select_one("table.table-striped")
         if not table:
@@ -1228,7 +1232,10 @@ def _sanitize_redirect_url(url: str) -> str:
     value = url.strip()
     parsed = urllib.parse.urlparse(value)
     if parsed.scheme == "magnet":
-        return value
+        # HTTP headers are latin-1. ext.to magnets can carry Unicode display
+        # names (e.g. Japanese titles), so percent-encode them while keeping
+        # existing escapes and URI delimiters intact.
+        return urllib.parse.quote(value, safe="/:?&=%+;,@[]!$'()*~.-_")
     if parsed.scheme in ("http", "https"):
         return urllib.parse.urlunparse(
             parsed._replace(
