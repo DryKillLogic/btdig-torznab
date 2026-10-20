@@ -73,6 +73,12 @@ REQUEST_BUDGET = float(os.environ.get("EXT_TO_REQUEST_BUDGET", "120"))
 SESSION_TIMEOUT = float(os.environ.get("EXT_TO_SESSION_TIMEOUT", "45"))
 # A deep walk is capped at ext.to's ~1000-result ceiling: 20 pages of 50.
 MAX_WALK_PAGES = int(os.environ.get("EXT_TO_MAX_WALK_PAGES", "20"))
+# A season pack holds the requested episode but is not that episode's own
+# release: its title names no episode at all. Off by default so a filtered walk
+# only yields releases of the exact requested episode.
+INCLUDE_SEASON_PACKS = os.environ.get(
+    "EXT_TO_INCLUDE_SEASON_PACKS", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _build_public_base_url(public_host: str, fallback_host: str, port: int) -> str:
@@ -136,7 +142,12 @@ _RE_SIZE = re.compile(r"([\d.,]+)\s*(B|KB|MB|GB|TB)\b", re.IGNORECASE)
 _RE_GUID_INFOHASH = re.compile(r"/t/(?:[^/]+-)?([0-9a-fA-F]{40,64})/")
 _RE_URL_TORRENT_ID = re.compile(r"-(\d+)/?$")
 # Season/episode markers as release titles spell them: S07E04, S7E4, 7x04.
-_RE_TITLE_SE = re.compile(r"s(\d{1,2})[\s._-]*e(\d{1,4})|(\d{1,2})x(\d{1,4})")
+# S07E04, S7E4, 7x04 — and the multi-episode forms S07E04E05 / S07E04-E05 /
+# S07E04-05, which name more than one episode of the SAME season.
+_RE_TITLE_SE = re.compile(
+    r"s(\d{1,2})[\s._-]*e(\d{1,4})(?:[\s._-]*(?:e|\-)[\s._-]*(\d{1,4}))?"
+    r"|(\d{1,2})x(\d{1,4})(?:[\s._-]*(?:x|\-)[\s._-]*(\d{1,4}))?"
+)
 _RE_TITLE_SEASON = re.compile(r"s(\d{1,2})(?!\d)|season[\s._-]*(\d{1,2})")
 _RE_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _RE_WORD_TIME = re.compile(
@@ -342,9 +353,15 @@ def _title_pairs(title: str) -> tuple[set, set]:
     pairs = set()
     for match in _RE_TITLE_SE.finditer(norm):
         if match.group(1) is not None:
-            pairs.add((int(match.group(1)), int(match.group(2))))
+            season = int(match.group(1))
+            for episode in match.groups()[1::2]:
+                if episode:
+                    pairs.add((season, int(episode)))
         else:
-            pairs.add((int(match.group(3)), int(match.group(4))))
+            season = int(match.group(4))
+            for episode in match.groups()[4::2]:
+                if episode:
+                    pairs.add((season, int(episode)))
     seasons = {season for season, _episode in pairs}
     for match in _RE_TITLE_SEASON.finditer(norm):
         value = match.group(1) or match.group(2)
@@ -366,13 +383,13 @@ def title_targets(season: Optional[int], episode: Optional[int]):
 
     def keep(title: str) -> bool:
         pairs, seasons = _title_pairs(title)
-        if episode is not None and (season, episode) in pairs:
-            return True
-        if not pairs and season in seasons:
-            return True  # a season-level release: the pack may hold the episode
-        if episode is None and season in seasons:
-            return True
-        return False
+        if episode is not None:
+            if pairs:
+                # Exactly this episode of exactly this season: a range counts
+                # when it covers it, another season's or episode's release never.
+                return (season, episode) in pairs
+            return INCLUDE_SEASON_PACKS and season in seasons
+        return season in seasons
 
     return keep
 

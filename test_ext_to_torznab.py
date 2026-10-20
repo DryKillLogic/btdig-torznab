@@ -813,15 +813,27 @@ class TestTargetFilter(unittest.TestCase):
     contain the target come back, which is what makes a 20-page walk usable.
     """
 
-    def test_title_targets_keeps_the_episode_and_its_season_packs(self):
+    def test_title_targets_keeps_only_the_requested_episode(self):
         keep = ext.title_targets(7, 4)
 
         self.assertTrue(keep("The.Rookie.S07E04.1080p.WEB"))
         self.assertTrue(keep("The.Rookie.S7E4.720p"))
         self.assertTrue(keep("The.Rookie.7x04.HDTV"))
-        self.assertTrue(keep("The.Rookie.S07.Complete.1080p"))
+        # A range covers the requested episode, so it is kept.
+        self.assertTrue(keep("The.Rookie.S07E04E05.1080p"))
+        self.assertTrue(keep("The.Rookie.S07E04-E05.1080p"))
+        # Another season, or another episode of the same season, never.
         self.assertFalse(keep("The.Rookie.S06E04.1080p"))
+        self.assertFalse(keep("The.Rookie.S08E04.1080p"))
         self.assertFalse(keep("The.Rookie.S07E05.1080p"))
+        self.assertFalse(keep("The.Rookie.S17E09.1080p"))
+
+    def test_a_season_pack_is_excluded_unless_explicitly_enabled(self):
+        pack = "The.Rookie.S07.Complete.1080p"
+
+        self.assertFalse(ext.title_targets(7, 4)(pack))
+        with patch.object(ext, "INCLUDE_SEASON_PACKS", True):
+            self.assertTrue(ext.title_targets(7, 4)(pack))
 
     def test_title_targets_without_an_episode_keeps_the_whole_season(self):
         keep = ext.title_targets(7, None)
