@@ -164,6 +164,9 @@ python3 ext_to_torznab.py
 | `EXT_TO_FAILURE_THRESHOLD` | `5`                 | Consecutive FlareSolverr failures before the circuit opens                                        |
 | `EXT_TO_COOLDOWN`      | `30`                    | Seconds the FlareSolverr circuit stays open                                                       |
 | `EXT_TO_ENRICH_LIMIT`  | `20`                    | Max results enriched with magnets per search (`0` = no limit)                                     |
+| `EXT_TO_REQUEST_BUDGET` | `120`                  | Wall-clock budget for one search request. The page walk and magnet enrichment stop when it is spent and the request answers with what it collected — a client that gets 300 rows beats a client that gets a timeout |
+| `EXT_TO_SESSION_TIMEOUT` | `45`                  | How long a request waits for a free FlareSolverr session before failing fast. Blocking forever is how an abandoned client (its own timeout fired, the bridge kept working) wedged every later request |
+| `EXT_TO_MAX_WALK_PAGES` | `20`                   | Upper bound for `pages` — 20 × 50 rows covers ext.to's ~1000-result ceiling |
 
 When `PUBLIC_HOST` is not set, the bridge reuses `EXT_TO_HOST` as the public-facing host. Keep the bind host local (for example `0.0.0.0:5556`) and set `PUBLIC_HOST` to the public hostname only when you need the Torznab feed to advertise a production URL instead of the bind address.
 
@@ -173,6 +176,8 @@ The same Torznab protocol as btdig, plus:
 
 | Feature             | Details                                       |
 | ------------------- | --------------------------------------------- |
+| `pages=N`           | Walk N ext.to pages inside ONE request on ONE FlareSolverr session and return every row. Each page fetch is a Cloudflare-bypassed round trip, so a deep walk costs one challenge instead of N — a client walking pages itself pays the challenge per page and times out. With `pages>1` the response is the whole walked set (not the `limit` window) |
+| `enrich=0`          | Skip per-magnet enrichment; rows keep their `t=download` link so the client resolves only what it keeps |
 | `t=download`        | On-demand magnet resolution for a GUID        |
 | `t=search`          | Free-text search                              |
 | `t=tvsearch`        | TV search with `season`, `ep` params          |

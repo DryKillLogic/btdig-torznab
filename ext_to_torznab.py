@@ -64,6 +64,16 @@ FLARESOLVERR_COOLDOWN = int(os.environ.get("EXT_TO_COOLDOWN", "30"))
 # 0 disables the limit.
 ENRICH_LIMIT = int(os.environ.get("EXT_TO_ENRICH_LIMIT", "20"))
 
+# Every page fetch goes through FlareSolverr (Cloudflare), so a request is
+# expensive and, while the challenge is unsolved, unbounded. These two caps are
+# what turn "slow" into "answers": the request returns what it collected when
+# the budget is spent, and a request that cannot get a session fails fast
+# instead of queueing behind one forever (a wedged bridge looks like a hang).
+REQUEST_BUDGET = float(os.environ.get("EXT_TO_REQUEST_BUDGET", "120"))
+SESSION_TIMEOUT = float(os.environ.get("EXT_TO_SESSION_TIMEOUT", "45"))
+# A deep walk is capped at ext.to's ~1000-result ceiling: 20 pages of 50.
+MAX_WALK_PAGES = int(os.environ.get("EXT_TO_MAX_WALK_PAGES", "20"))
+
 
 def _build_public_base_url(public_host: str, fallback_host: str, port: int) -> str:
     """Return the URL the Torznab RSS should advertise to clients.
@@ -383,7 +393,16 @@ class FlareSolverrClient:
         return session_id
 
     def _acquire_session(self) -> str:
-        self._session_slots.acquire()
+        # A request that cannot get a session must fail fast: every session
+        # belongs to an operation that may be mid-challenge, and blocking here
+        # is how an abandoned client wedged the bridge — its operation keeps
+        # running, the session is never released, and later requests queue
+        # forever with no response at all.
+        if not self._session_slots.acquire(timeout=SESSION_TIMEOUT):
+            self._record_failure()
+            raise FlareSolverrError(
+                f"no FlareSolverr session free after {SESSION_TIMEOUT:.0f}s"
+            )
         try:
             with self._sessions_lock:
                 if self._free_sessions:
@@ -624,7 +643,8 @@ class ExtToScraper:
     def search(self, query: str = "", categories: Optional[list[int]] = None,
                season: Optional[int] = None, episode: Optional[int] = None,
                offset: int = 0, limit: int = 25,
-               sort: str = "age", order: str = "desc") -> list[dict]:
+               sort: str = "age", order: str = "desc",
+               pages: int = 1, enrich: bool = True) -> list[dict]:
         effective_query = query.strip()
         if effective_query and season is not None:
             if episode is not None:
@@ -632,6 +652,7 @@ class ExtToScraper:
             else:
                 effective_query = f"{effective_query} S{season:02d}"
 
+        pages = max(1, min(int(pages or 1), MAX_WALK_PAGES))
         cache_key = (
             effective_query,
             tuple(categories or ()),
@@ -639,6 +660,8 @@ class ExtToScraper:
             limit,
             sort,
             order,
+            pages,
+            enrich,
         )
         now = time.time()
         with self._cache_lock:
@@ -647,16 +670,18 @@ class ExtToScraper:
                 logger.debug("Search cache hit: %r", effective_query)
                 return [dict(item) for item in cached[1]]
 
+        deadline = time.monotonic() + REQUEST_BUDGET
         with self._fs.operation() as session:
             # Keywordless → browse category pages to avoid 522
             if not effective_query:
                 results = self._browse_by_categories(
-                    categories or [], offset, limit, session
+                    categories or [], offset, limit, session,
+                    deadline=deadline, pages=pages, enrich=enrich,
                 )
             else:
                 results = self._search_pages(
                     effective_query, categories, offset, limit, sort, order,
-                    session,
+                    session, deadline=deadline, pages=pages, enrich=enrich,
                 )
 
         # Empty results are cached briefly so an outage doesn't hammer ext.to,
@@ -674,15 +699,34 @@ class ExtToScraper:
                       categories: Optional[list[int]],
                       offset: int, limit: int,
                       sort: str, order: str,
-                      session: str) -> list[dict]:
+                      session: str,
+                      deadline: Optional[float] = None,
+                      pages: int = 1,
+                      enrich: bool = True) -> list[dict]:
+        """Walk up to `pages` ext.to pages on ONE FlareSolverr session.
+
+        Each page costs a Cloudflare-bypassed fetch, so the walk happens inside
+        a single request/session instead of one request per page: the challenge
+        is paid once and the following pages reuse the solved session. The
+        walk stops at the requested page count, at a short/empty page, or when
+        the request budget is spent — returning what it collected, because a
+        client that gets 300 rows beats a client that gets a timeout.
+        """
         start_page = (offset // _RESULTS_PER_PAGE) + 1
-        pages_needed = max(1, -(-limit // _RESULTS_PER_PAGE))
+        pages_needed = max(1, pages if pages > 1 else -(-limit // _RESULTS_PER_PAGE))
 
         all_results: list[dict] = []
         last_html = ""
         last_url = ""
+        walked = 0
 
         for page in range(start_page, start_page + pages_needed):
+            if walked and deadline is not None and time.monotonic() > deadline:
+                logger.warning(
+                    "request budget (%.0fs) spent after %d page(s), %d row(s)",
+                    REQUEST_BUDGET, walked, len(all_results),
+                )
+                break
             url = self._build_url(
                 effective_query, page, sort, order, categories
             )
@@ -695,6 +739,7 @@ class ExtToScraper:
                 logger.error("FlareSolverr error: %s", exc)
                 break
 
+            walked += 1
             last_html = html
             last_url = url
             page_results = self._parse_html(html)
@@ -704,16 +749,28 @@ class ExtToScraper:
                 break
 
         # Enrich with magnets
-        if last_html and all_results:
+        if enrich and last_html and all_results:
             self._enrich_with_magnets(
-                all_results, last_url, last_html, session
+                all_results, last_url, last_html, session, deadline=deadline
             )
+
+        if pages > 1:
+            # A deep walk returns everything it walked; the caller asked for it.
+            logger.info(
+                "deep walk: %d page(s), %d row(s), %d magnet(s)",
+                walked, len(all_results),
+                sum(1 for r in all_results if r.get("magnet_url")),
+            )
+            return all_results
 
         local_offset = offset % _RESULTS_PER_PAGE if offset > 0 else 0
         return all_results[local_offset:local_offset + limit]
 
     def _browse_by_categories(self, categories: list[int], offset: int,
-                               limit: int, session: str) -> list[dict]:
+                               limit: int, session: str,
+                               deadline: Optional[float] = None,
+                               pages: int = 1,
+                               enrich: bool = True) -> list[dict]:
         paths_seen: set = set()
         browse_paths: list[str] = []
         for cat in (categories or []):
@@ -760,10 +817,13 @@ class ExtToScraper:
                        for fc in categories)
             ]
 
-        if last_html and all_results:
+        if enrich and last_html and all_results:
             self._enrich_with_magnets(
-                all_results, last_url, last_html, session
+                all_results, last_url, last_html, session, deadline=deadline
             )
+
+        if pages > 1:
+            return all_results
 
         local_offset = offset % _RESULTS_PER_PAGE if offset > 0 else 0
         return all_results[local_offset:local_offset + limit]
@@ -925,7 +985,8 @@ class ExtToScraper:
     # -------------------------------------------------------------------
 
     def _enrich_with_magnets(self, results: list[dict], page_url: str,
-                              page_html: str, session: str) -> None:
+                              page_html: str, session: str,
+                              deadline: Optional[float] = None) -> None:
         page_token, csrf_token = _extract_js_tokens(page_html)
         if not page_token or not csrf_token:
             logger.warning(
@@ -1001,8 +1062,19 @@ class ExtToScraper:
         # The operation owns one FlareSolverr session, so requests must be
         # sequential; concurrent POSTs on a session return each other's data.
         targets = results[:ENRICH_LIMIT] if ENRICH_LIMIT > 0 else results
+        fetched = 0
         for item in targets:
+            # Every magnet is another FlareSolverr round trip; stop when the
+            # request budget is gone and leave the rest to the client's
+            # t=download resolution rather than never answering at all.
+            if deadline is not None and time.monotonic() > deadline:
+                logger.warning(
+                    "enrichment budget spent: %d of %d magnet(s) fetched",
+                    fetched, len(targets),
+                )
+                break
             fetch_one(item)
+            fetched += 1
 
         success_count = sum(1 for r in results if r.get("magnet_url"))
         logger.info(
@@ -1282,6 +1354,13 @@ class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
             limit = min(int(params.get("limit", ["25"])[0]), 100)
             sort = params.get("sort", ["age"])[0].strip() or "age"
             order = params.get("order", ["desc"])[0].strip() or "desc"
+            # pages=N walks N ext.to pages inside this one request on one
+            # session (one Cloudflare challenge instead of N), and enrich=0
+            # skips the per-magnet round trips for a cheap deep walk.
+            pages = int(params.get("pages", ["1"])[0] or 1)
+            enrich = params.get("enrich", ["1"])[0].strip().lower() not in (
+                "0", "false", "no", "off"
+            )
 
             categories = []
             if cat:
@@ -1303,6 +1382,7 @@ class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
                     season=season, episode=episode,
                     offset=offset, limit=limit,
                     sort=sort, order=order,
+                    pages=pages, enrich=enrich,
                 )
             except FlareSolverrError as exc:
                 logger.error("FlareSolverr error: %s", exc)

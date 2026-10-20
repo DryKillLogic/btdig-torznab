@@ -8,6 +8,7 @@ They test the pure functions and parser logic with sample HTML/data.
 
 import time
 import unittest
+import urllib.parse
 from contextlib import contextmanager
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
@@ -675,3 +676,130 @@ class TestCatMatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Deep walk: pages= / enrich= / request budget / session timeout
+# ---------------------------------------------------------------------------
+
+
+def _page_html(count, start=0, title_prefix="Release"):
+    rows = []
+    for index in range(count):
+        tid = start + index
+        rows.append(f"""
+<tr>
+  <td>
+    <a class="torrent-title-link" href="/release-{tid}/"
+       data-tooltip="{title_prefix} {tid} 1080p WEB-DL">Release {tid}</a>
+    <a class="search-magnet-btn" data-id="{tid}">Magnet</a>
+  </td>
+  <td><span>1.0 GB</span></td>
+  <td><span>3</span></td>
+  <td><span title="01 June 2026">01 Jun 26</span></td>
+  <td><span class="text-success">10</span></td>
+  <td><span class="text-danger">1</span></td>
+</tr>""")
+    return (
+        '<!doctype html><html><head>'
+        '<meta name="csrf-token" content="aabbccdd00112233">'
+        '<script>window.searchPageToken = "deadbeef12345678";</script>'
+        '</head><body><table class="table table-striped"><tbody>'
+        + "".join(rows)
+        + "</tbody></table></body></html>"
+    )
+
+
+class _PagedFlareSolverr(_FakeFlareSolverr):
+    """Serves a different page per request, like the real bridge."""
+
+    def __init__(self, pages, post_result=None):
+        super().__init__(pages[0] if pages else _page_html(0), post_result)
+        self.pages = list(pages)
+        self.urls = []
+
+    def get_page_with_cookies(self, url, session=None):
+        self.get_calls += 1
+        self.urls.append(url)
+        index = min(self.get_calls - 1, len(self.pages) - 1)
+        return self.pages[index], {}, ""
+
+
+class TestDeepWalk(unittest.TestCase):
+    """pages=N turns N client round trips into one, on one FlareSolverr session.
+
+    Every page fetch is a Cloudflare-bypassed round trip, so the walk has to
+    happen inside a single request — and it has to answer even when the budget
+    is gone, because a client that waits on a wedged bridge gets nothing at all.
+    """
+
+    def test_pages_walks_the_requested_number_of_pages(self):
+        fs = _PagedFlareSolverr([_page_html(50, start=p * 100) for p in range(5)])
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        results = scraper.search("Show", limit=50, pages=3, enrich=False)
+
+        self.assertEqual(fs.get_calls, 3)
+        self.assertEqual(len(results), 150)
+        self.assertEqual(
+            [urllib.parse.parse_qs(urllib.parse.urlparse(u).query).get("page", ["1"])[0]
+             for u in fs.urls],
+            ["1", "2", "3"],
+        )
+
+    def test_pages_stops_at_a_short_page(self):
+        fs = _PagedFlareSolverr([_page_html(50), _page_html(4)])
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        results = scraper.search("Show", limit=50, pages=5, enrich=False)
+
+        self.assertEqual(fs.get_calls, 2)
+        self.assertEqual(len(results), 54)
+
+    def test_enrich_off_skips_every_magnet_round_trip(self):
+        fs = _PagedFlareSolverr([_page_html(50)], post_result={"success": True, "hash": "a" * 40})
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        results = scraper.search("Show", limit=50, enrich=False)
+
+        self.assertEqual(fs.post_calls, 0)
+        self.assertEqual(len(results), 50)
+        self.assertTrue(all(not r["magnet_url"] for r in results))
+
+    def test_enrich_on_still_fetches_magnets(self):
+        fs = _PagedFlareSolverr([_page_html(3, start=1)], post_result={"success": True, "hash": "a" * 40})
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        results = scraper.search("Show", limit=50, enrich=True)
+
+        self.assertEqual(fs.post_calls, 3)
+        self.assertTrue(all(r["magnet_url"] for r in results))
+
+    def test_request_budget_ends_the_walk_and_still_answers(self):
+        fs = _PagedFlareSolverr([_page_html(50, start=p * 100) for p in range(5)])
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        with patch.object(ext, "REQUEST_BUDGET", 0):
+            results = scraper.search("Show", limit=50, pages=5, enrich=False)
+
+        self.assertEqual(fs.get_calls, 1)
+        self.assertEqual(len(results), 50)
+
+
+class TestSessionStarvation(unittest.TestCase):
+    """A request must never queue forever behind a session it cannot get."""
+
+    def test_acquire_fails_fast_when_every_session_is_busy(self):
+        fs = ext.FlareSolverrClient("http://fs.test", max_sessions=1)
+        fs._session_slots.acquire()  # every session is held by a slow operation
+
+        with (
+            patch.object(ext, "SESSION_TIMEOUT", 0.05),
+            patch.object(fs, "_record_failure"),
+        ):
+            started = time.monotonic()
+            with self.assertRaisesRegex(ext.FlareSolverrError, "no FlareSolverr session free"):
+                fs._acquire_session()
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 2.0, "acquisition must not block indefinitely")
