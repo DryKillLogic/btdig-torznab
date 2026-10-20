@@ -873,3 +873,16 @@ class TestTargetFilter(unittest.TestCase):
         results = scraper.search("Anything", limit=50)
 
         self.assertEqual(len(results), 3)
+
+
+class TestSessionPool(unittest.TestCase):
+    def test_default_pool_leaves_room_for_the_other_queries(self):
+        """A deep walk holds one session for its whole walk, so 2 is not enough.
+
+        Two sessions were fully consumed by one client's concurrent searches;
+        every other request queued behind them and looked like a dead endpoint.
+        """
+
+        client = ext.FlareSolverrClient("http://fs.test")
+
+        self.assertEqual(client._max_sessions, 3)

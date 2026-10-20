@@ -121,7 +121,10 @@ _MAGNET_API_PATH = "/ajax/getSearchMagnet.php"
 _DETAIL_MAGNET_API_PATH = "/ajax/getTorrentMagnet.php"
 # FlareSolverr sessions own one browser context each. Operations borrow a
 # session for their whole lifetime so concurrent requests never share one.
-FLARESOLVERR_SESSIONS = int(os.environ.get("EXT_TO_FLARESOLVERR_SESSIONS", "2"))
+# Three sessions by default: two were fully consumed by one client's concurrent
+# searches, so every other request queued behind them and a deep walk (which
+# holds a session for its whole page walk) would have starved the rest.
+FLARESOLVERR_SESSIONS = int(os.environ.get("EXT_TO_FLARESOLVERR_SESSIONS", "3"))
 
 # Pre-compiled regex patterns
 _RE_HTML_TAGS = re.compile(r"<[^>]+>")
