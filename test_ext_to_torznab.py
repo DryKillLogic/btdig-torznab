@@ -803,3 +803,61 @@ class TestSessionStarvation(unittest.TestCase):
             elapsed = time.monotonic() - started
 
         self.assertLess(elapsed, 2.0, "acquisition must not block indefinitely")
+
+
+class TestTargetFilter(unittest.TestCase):
+    """A deep walk keeps the releases that can hold the requested episode.
+
+    ext.to matches loosely (~1000 rows for one episode query), so the walk is
+    not shortened - every page is still read - but only the rows that can
+    contain the target come back, which is what makes a 20-page walk usable.
+    """
+
+    def test_title_targets_keeps_the_episode_and_its_season_packs(self):
+        keep = ext.title_targets(7, 4)
+
+        self.assertTrue(keep("The.Rookie.S07E04.1080p.WEB"))
+        self.assertTrue(keep("The.Rookie.S7E4.720p"))
+        self.assertTrue(keep("The.Rookie.7x04.HDTV"))
+        self.assertTrue(keep("The.Rookie.S07.Complete.1080p"))
+        self.assertFalse(keep("The.Rookie.S06E04.1080p"))
+        self.assertFalse(keep("The.Rookie.S07E05.1080p"))
+
+    def test_title_targets_without_an_episode_keeps_the_whole_season(self):
+        keep = ext.title_targets(7, None)
+
+        self.assertTrue(keep("The.Rookie.S07E05.1080p"))
+        self.assertTrue(keep("The.Rookie.S07.Complete"))
+        self.assertFalse(keep("The.Rookie.S08E01.1080p"))
+
+    def test_deep_walk_returns_only_matching_rows_but_reads_every_page(self):
+        page = [
+            ("The.Rookie.S07E04.1080p", 1),
+            ("The.Rookie.S07E05.1080p", 2),
+            ("The.Rookie.S07E04.720p", 3),
+        ]
+        fs = _PagedFlareSolverr([
+            _page_html(50, start=p * 100, title_prefix=page[p % len(page)][0])
+            for p in range(4)
+        ])
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        results = scraper.search(
+            "The Rookie S07E04", limit=50, pages=4, enrich=False,
+            filter_season=7, filter_episode=4,
+        )
+
+        self.assertEqual(fs.get_calls, 4, "the walk is not cut short by the filter")
+        self.assertTrue(results)
+        self.assertTrue(
+            all("S07E04" in row["title"] for row in results),
+            [row["title"] for row in results],
+        )
+
+    def test_plain_search_is_not_filtered(self):
+        fs = _PagedFlareSolverr([_page_html(3, start=1, title_prefix="Anything")])
+        scraper = ext.ExtToScraper("https://ext.to", fs)
+
+        results = scraper.search("Anything", limit=50)
+
+        self.assertEqual(len(results), 3)

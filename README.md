@@ -178,6 +178,7 @@ The same Torznab protocol as btdig, plus:
 | ------------------- | --------------------------------------------- |
 | `pages=N`           | Walk N ext.to pages inside ONE request on ONE FlareSolverr session and return every row. Each page fetch is a Cloudflare-bypassed round trip, so a deep walk costs one challenge instead of N — a client walking pages itself pays the challenge per page and times out. With `pages>1` the response is the whole walked set (not the `limit` window) |
 | `enrich=0`          | Skip per-magnet enrichment; rows keep their `t=download` link so the client resolves only what it keeps |
+| `season=`/`ep=` with `pages>1` | Filter the walk by the target: keep an episode's own releases (S07E04, S7E4, 7x04) plus its season packs, or every release of a season when `ep` is absent. The walk still reads every page — the filter decides what comes back, never how far we go. Ignored for `pages=1`, so ordinary searches stay a raw pass-through |
 | `t=download`        | On-demand magnet resolution for a GUID        |
 | `t=search`          | Free-text search                              |
 | `t=tvsearch`        | TV search with `season`, `ep` params          |

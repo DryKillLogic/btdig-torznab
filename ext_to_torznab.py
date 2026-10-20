@@ -135,6 +135,10 @@ _RE_CSRF_FALLBACK = re.compile(
 _RE_SIZE = re.compile(r"([\d.,]+)\s*(B|KB|MB|GB|TB)\b", re.IGNORECASE)
 _RE_GUID_INFOHASH = re.compile(r"/t/(?:[^/]+-)?([0-9a-fA-F]{40,64})/")
 _RE_URL_TORRENT_ID = re.compile(r"-(\d+)/?$")
+# Season/episode markers as release titles spell them: S07E04, S7E4, 7x04.
+_RE_TITLE_SE = re.compile(r"s(\d{1,2})[\s._-]*e(\d{1,4})|(\d{1,2})x(\d{1,4})")
+_RE_TITLE_SEASON = re.compile(r"s(\d{1,2})(?!\d)|season[\s._-]*(\d{1,2})")
+_RE_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _RE_WORD_TIME = re.compile(
     r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s*(?:ago)?",
     re.IGNORECASE,
@@ -330,6 +334,47 @@ def _parse_date(raw: str) -> str:
             pass
 
     return now.strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+
+def _title_pairs(title: str) -> tuple[set, set]:
+    """Return ({(season, episode)}, {season}) named by a release title."""
+    norm = _RE_NON_ALNUM.sub(" ", (title or "").lower())
+    pairs = set()
+    for match in _RE_TITLE_SE.finditer(norm):
+        if match.group(1) is not None:
+            pairs.add((int(match.group(1)), int(match.group(2))))
+        else:
+            pairs.add((int(match.group(3)), int(match.group(4))))
+    seasons = {season for season, _episode in pairs}
+    for match in _RE_TITLE_SEASON.finditer(norm):
+        value = match.group(1) or match.group(2)
+        if value:
+            seasons.add(int(value))
+    return pairs, seasons
+
+
+def title_targets(season: Optional[int], episode: Optional[int]):
+    """Build a predicate keeping the releases that can contain the target.
+
+    An episode target keeps its own SxxEyy releases (in any spelling) plus the
+    season packs for that season, because a pack legitimately contains the
+    episode. Without it, a season query keeps every release of that season.
+    """
+
+    if season is None:
+        return None
+
+    def keep(title: str) -> bool:
+        pairs, seasons = _title_pairs(title)
+        if episode is not None and (season, episode) in pairs:
+            return True
+        if not pairs and season in seasons:
+            return True  # a season-level release: the pack may hold the episode
+        if episode is None and season in seasons:
+            return True
+        return False
+
+    return keep
 
 
 def _extract_js_tokens(html: str) -> tuple[str, str]:
@@ -644,7 +689,9 @@ class ExtToScraper:
                season: Optional[int] = None, episode: Optional[int] = None,
                offset: int = 0, limit: int = 25,
                sort: str = "age", order: str = "desc",
-               pages: int = 1, enrich: bool = True) -> list[dict]:
+               pages: int = 1, enrich: bool = True,
+               filter_season: Optional[int] = None,
+               filter_episode: Optional[int] = None) -> list[dict]:
         effective_query = query.strip()
         if effective_query and season is not None:
             if episode is not None:
@@ -662,6 +709,8 @@ class ExtToScraper:
             order,
             pages,
             enrich,
+            filter_season,
+            filter_episode,
         )
         now = time.time()
         with self._cache_lock:
@@ -682,6 +731,7 @@ class ExtToScraper:
                 results = self._search_pages(
                     effective_query, categories, offset, limit, sort, order,
                     session, deadline=deadline, pages=pages, enrich=enrich,
+                    keep=title_targets(filter_season, filter_episode),
                 )
 
         # Empty results are cached briefly so an outage doesn't hammer ext.to,
@@ -702,7 +752,8 @@ class ExtToScraper:
                       session: str,
                       deadline: Optional[float] = None,
                       pages: int = 1,
-                      enrich: bool = True) -> list[dict]:
+                      enrich: bool = True,
+                      keep=None) -> list[dict]:
         """Walk up to `pages` ext.to pages on ONE FlareSolverr session.
 
         Each page costs a Cloudflare-bypassed fetch, so the walk happens inside
@@ -719,6 +770,7 @@ class ExtToScraper:
         last_html = ""
         last_url = ""
         walked = 0
+        scanned = 0
 
         for page in range(start_page, start_page + pages_needed):
             if walked and deadline is not None and time.monotonic() > deadline:
@@ -742,11 +794,20 @@ class ExtToScraper:
             walked += 1
             last_html = html
             last_url = url
-            page_results = self._parse_html(html)
+            raw_results = self._parse_html(html)
+            scanned += len(raw_results)
+            page_results = raw_results
+            if keep is not None:
+                # Relevance is decided per row, never by stopping the walk
+                # early: every page is still read to the end of ext.to's result
+                # set, and only the releases that can hold the target come back.
+                page_results = [
+                    row for row in raw_results if keep(row.get("title", ""))
+                ]
             all_results.extend(page_results)
 
-            if len(page_results) < _RESULTS_PER_PAGE:
-                break
+            if len(raw_results) < _RESULTS_PER_PAGE:
+                break  # the result set ends here
 
         # Enrich with magnets
         if enrich and last_html and all_results:
@@ -757,8 +818,9 @@ class ExtToScraper:
         if pages > 1:
             # A deep walk returns everything it walked; the caller asked for it.
             logger.info(
-                "deep walk: %d page(s), %d row(s), %d magnet(s)",
-                walked, len(all_results),
+                "deep walk: %d page(s), %d scanned, %d kept%s, %d magnet(s)",
+                walked, scanned, len(all_results),
+                "" if keep is None else " (filtered to the requested episode)",
                 sum(1 for r in all_results if r.get("magnet_url")),
             )
             return all_results
@@ -1383,6 +1445,12 @@ class ExtTorznabHandler(http.server.BaseHTTPRequestHandler):
                     offset=offset, limit=limit,
                     sort=sort, order=order,
                     pages=pages, enrich=enrich,
+                    # A deep walk is filtered by the requested season/episode so
+                    # the caller gets the releases that can hold the target out
+                    # of a ~1000-row loose match set, without the walk stopping
+                    # early. Plain searches (pages=1) keep the raw pass-through.
+                    filter_season=season if pages > 1 else None,
+                    filter_episode=episode if pages > 1 else None,
                 )
             except FlareSolverrError as exc:
                 logger.error("FlareSolverr error: %s", exc)
