@@ -828,12 +828,14 @@ class TestTargetFilter(unittest.TestCase):
         self.assertFalse(keep("The.Rookie.S07E05.1080p"))
         self.assertFalse(keep("The.Rookie.S17E09.1080p"))
 
-    def test_a_season_pack_is_excluded_unless_explicitly_enabled(self):
+    def test_a_season_pack_is_kept_unless_explicitly_disabled(self):
+        """A pack holds the episode, so it is a valid result for that season."""
+
         pack = "The.Rookie.S07.Complete.1080p"
 
-        self.assertFalse(ext.title_targets(7, 4)(pack))
-        with patch.object(ext, "INCLUDE_SEASON_PACKS", True):
-            self.assertTrue(ext.title_targets(7, 4)(pack))
+        self.assertTrue(ext.title_targets(7, 4)(pack))
+        with patch.object(ext, "INCLUDE_SEASON_PACKS", False):
+            self.assertFalse(ext.title_targets(7, 4)(pack))
 
     def test_title_targets_without_an_episode_keeps_the_whole_season(self):
         keep = ext.title_targets(7, None)
@@ -886,3 +888,25 @@ class TestSessionPool(unittest.TestCase):
         client = ext.FlareSolverrClient("http://fs.test")
 
         self.assertEqual(client._max_sessions, 3)
+
+
+class TestSeasonRangePacks(unittest.TestCase):
+    """A multi-season pack covers the seasons between its two markers."""
+
+    def test_season_range_is_expanded(self):
+        self.assertEqual(
+            ext._title_pairs("Show.S01-S03.Complete")[1], {1, 2, 3}
+        )
+        self.assertEqual(ext._title_pairs("Show.S01-03")[1], {1, 2, 3})
+        self.assertTrue(ext.title_targets(2, 5)("Show.S01-S03.Complete"))
+
+    def test_an_episode_range_is_not_a_season_range(self):
+        pairs, seasons = ext._title_pairs("Show.S07E04-05.1080p")
+
+        self.assertEqual(seasons, {7})
+        self.assertEqual(pairs, {(7, 4), (7, 5)})
+        self.assertTrue(ext.title_targets(7, 5)("Show.S07E04-05.1080p"))
+        self.assertFalse(ext.title_targets(7, 6)("Show.S07E04-05.1080p"))
+
+    def test_a_pack_naming_no_season_cannot_match(self):
+        self.assertFalse(ext.title_targets(2, 5)("Show.Complete.Series.1080p"))

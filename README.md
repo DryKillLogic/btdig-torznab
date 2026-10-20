@@ -167,7 +167,7 @@ python3 ext_to_torznab.py
 | `EXT_TO_REQUEST_BUDGET` | `120`                  | Wall-clock budget for one search request. The page walk and magnet enrichment stop when it is spent and the request answers with what it collected — a client that gets 300 rows beats a client that gets a timeout |
 | `EXT_TO_SESSION_TIMEOUT` | `45`                  | How long a request waits for a free FlareSolverr session before failing fast. Blocking forever is how an abandoned client (its own timeout fired, the bridge kept working) wedged every later request |
 | `EXT_TO_MAX_WALK_PAGES` | `20`                   | Upper bound for `pages` — 20 × 50 rows covers ext.to's ~1000-result ceiling |
-| `EXT_TO_INCLUDE_SEASON_PACKS` | `false`      | Keep season packs when a filtered walk asked for one episode (a pack holds it, but names no episode itself) |
+| `EXT_TO_INCLUDE_SEASON_PACKS` | `true`       | Keep season packs when a filtered walk asked for one episode: a pack holds the episode, so it is a valid result even though its title names no episode |
 
 When `PUBLIC_HOST` is not set, the bridge reuses `EXT_TO_HOST` as the public-facing host. Keep the bind host local (for example `0.0.0.0:5556`) and set `PUBLIC_HOST` to the public hostname only when you need the Torznab feed to advertise a production URL instead of the bind address.
 
@@ -179,7 +179,7 @@ The same Torznab protocol as btdig, plus:
 | ------------------- | --------------------------------------------- |
 | `pages=N`           | Walk N ext.to pages inside ONE request on ONE FlareSolverr session and return every row. Each page fetch is a Cloudflare-bypassed round trip, so a deep walk costs one challenge instead of N — a client walking pages itself pays the challenge per page and times out. With `pages>1` the response is the whole walked set (not the `limit` window) |
 | `enrich=0`          | Skip per-magnet enrichment; rows keep their `t=download` link so the client resolves only what it keeps |
-| `season=`/`ep=` with `pages>1` | Filter the walk by the target: keep only that exact episode's releases (S07E04, S7E4, 7x04, or a range like S07E04E05 that covers it); another season or another episode is never kept. A season pack names no episode and is excluded unless `EXT_TO_INCLUDE_SEASON_PACKS=true`. Without `ep`, every release of that season is kept. The walk still reads every page — the filter decides what comes back, never how far we go. Ignored for `pages=1`, so ordinary searches stay a raw pass-through |
+| `season=`/`ep=` with `pages>1` | Filter the walk by the target. The SEASON is always required; `ep` only narrows it: with `ep` you get that episode's own releases (S07E04, S7E4, 7x04, or a range like S07E04E05 that covers it) plus the season packs (S07.Complete, S06-S07 — a pack holds the episode, so it is a valid result); without `ep`, every release of that season. Another season, or another episode of the same season, is never kept. A pack whose title names no season at all ("Complete Series") cannot be matched by season. The walk still reads every page — the filter decides what comes back, never how far we go. Ignored for `pages=1`, so ordinary searches stay a raw pass-through |
 | `t=download`        | On-demand magnet resolution for a GUID        |
 | `t=search`          | Free-text search                              |
 | `t=tvsearch`        | TV search with `season`, `ep` params          |

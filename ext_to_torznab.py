@@ -73,12 +73,14 @@ REQUEST_BUDGET = float(os.environ.get("EXT_TO_REQUEST_BUDGET", "120"))
 SESSION_TIMEOUT = float(os.environ.get("EXT_TO_SESSION_TIMEOUT", "45"))
 # A deep walk is capped at ext.to's ~1000-result ceiling: 20 pages of 50.
 MAX_WALK_PAGES = int(os.environ.get("EXT_TO_MAX_WALK_PAGES", "20"))
-# A season pack holds the requested episode but is not that episode's own
-# release: its title names no episode at all. Off by default so a filtered walk
-# only yields releases of the exact requested episode.
+# A season pack holds the requested episode, so it is a valid result even though
+# its title names no episode: the target is always the SEASON, and the episode
+# only narrows it. Packs written with season markers work (S07.Complete,
+# S06-S07, S01-S03); a pack whose title names no season at all ("Complete
+# Series") cannot be matched by season and is not returned by a filtered walk.
 INCLUDE_SEASON_PACKS = os.environ.get(
-    "EXT_TO_INCLUDE_SEASON_PACKS", "false"
-).strip().lower() in ("1", "true", "yes", "on")
+    "EXT_TO_INCLUDE_SEASON_PACKS", "true"
+).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _build_public_base_url(public_host: str, fallback_host: str, port: int) -> str:
@@ -147,11 +149,21 @@ _RE_URL_TORRENT_ID = re.compile(r"-(\d+)/?$")
 # Season/episode markers as release titles spell them: S07E04, S7E4, 7x04.
 # S07E04, S7E4, 7x04 — and the multi-episode forms S07E04E05 / S07E04-E05 /
 # S07E04-05, which name more than one episode of the SAME season.
-_RE_TITLE_SE = re.compile(
-    r"s(\d{1,2})[\s._-]*e(\d{1,4})(?:[\s._-]*(?:e|\-)[\s._-]*(\d{1,4}))?"
-    r"|(\d{1,2})x(\d{1,4})(?:[\s._-]*(?:x|\-)[\s._-]*(\d{1,4}))?"
+_RE_TITLE_SE = re.compile(r"s(\d{1,2})[\s._-]*e(\d{1,4})|(\d{1,2})x(\d{1,4})")
+# An episode range names two episodes of one season: S07E04E05, S07E04-E05,
+# S07E04-E5. Read from the RAW title, because normalisation flattens the hyphen.
+# The second episode is written E05, -E05 or -05; a two-digit minimum on the
+# bare form keeps "S07E04-5.1" (audio) from being read as episode 5.
+_RE_EPISODE_RANGE = re.compile(
+    r"s(\d{1,2})[\s._-]*e(\d{1,4})[\s._-]*"
+    r"(?:e[\s._-]*(\d{1,4})|-[\s._-]*e?[\s._-]*(\d{2,4})(?!\d))"
 )
 _RE_TITLE_SEASON = re.compile(r"s(\d{1,2})(?!\d)|season[\s._-]*(\d{1,2})")
+# A multi-season pack names a range: S01-S03, S01-03, S01 - S03. The seasons in
+# between are part of the pack even though no marker names them.
+_RE_TITLE_SEASON_RANGE = re.compile(
+    r"s(\d{1,2})[\s._-]*-[\s._-]*s?(\d{1,2})(?!\d)"
+)
 _RE_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _RE_WORD_TIME = re.compile(
     r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s*(?:ago)?",
@@ -352,24 +364,29 @@ def _parse_date(raw: str) -> str:
 
 def _title_pairs(title: str) -> tuple[set, set]:
     """Return ({(season, episode)}, {season}) named by a release title."""
-    norm = _RE_NON_ALNUM.sub(" ", (title or "").lower())
+    raw = (title or "").lower()
+    norm = _RE_NON_ALNUM.sub(" ", raw)
     pairs = set()
     for match in _RE_TITLE_SE.finditer(norm):
         if match.group(1) is not None:
-            season = int(match.group(1))
-            for episode in match.groups()[1::2]:
-                if episode:
-                    pairs.add((season, int(episode)))
+            pairs.add((int(match.group(1)), int(match.group(2))))
         else:
-            season = int(match.group(4))
-            for episode in match.groups()[4::2]:
-                if episode:
-                    pairs.add((season, int(episode)))
+            pairs.add((int(match.group(3)), int(match.group(4))))
+    for match in _RE_EPISODE_RANGE.finditer(raw):
+        season = int(match.group(1))
+        pairs.add((season, int(match.group(2))))
+        pairs.add((season, int(match.group(3) or match.group(4))))
     seasons = {season for season, _episode in pairs}
     for match in _RE_TITLE_SEASON.finditer(norm):
         value = match.group(1) or match.group(2)
         if value:
             seasons.add(int(value))
+    # S01-S03 covers 1, 2 and 3. The range is read from the RAW title so the
+    # hyphen survives normalisation; a bare cap keeps a typo from exploding.
+    for match in _RE_TITLE_SEASON_RANGE.finditer(raw):
+        low, high = int(match.group(1)), int(match.group(2))
+        if low <= high and high - low <= 20:
+            seasons.update(range(low, high + 1))
     return pairs, seasons
 
 
@@ -386,13 +403,15 @@ def title_targets(season: Optional[int], episode: Optional[int]):
 
     def keep(title: str) -> bool:
         pairs, seasons = _title_pairs(title)
-        if episode is not None:
-            if pairs:
-                # Exactly this episode of exactly this season: a range counts
-                # when it covers it, another season's or episode's release never.
-                return (season, episode) in pairs
-            return INCLUDE_SEASON_PACKS and season in seasons
-        return season in seasons
+        if season not in seasons and not any(s == season for s, _e in pairs):
+            return False  # another season (or no season at all): never a match
+        if not pairs:
+            # A season-level release: the pack holds the episode.
+            return INCLUDE_SEASON_PACKS
+        if episode is None:
+            return True  # any episode of the season satisfies a season target
+        # A range counts when it covers the episode; another episode never does.
+        return (season, episode) in pairs
 
     return keep
 
