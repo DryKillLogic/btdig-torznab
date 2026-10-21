@@ -416,6 +416,31 @@ def title_targets(season: Optional[int], episode: Optional[int]):
     return keep
 
 
+def _collapse_duplicate_tokens(query: str) -> str:
+    """Drop repeated words: ext.to's search stalls on "S01E14 S01E14".
+
+    A client that names the season/episode inside `q` AND sends `season`/`ep`
+    used to get the marker appended twice, and those queries came back empty.
+    """
+
+    seen = set()
+    kept = []
+    for token in (query or "").split():
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(token)
+    return " ".join(kept)
+
+
+def _query_names_target(query: str, season: int, episode: Optional[int]) -> bool:
+    pairs, seasons = _title_pairs(query)
+    if episode is not None:
+        return (season, episode) in pairs
+    return season in seasons
+
+
 def _extract_js_tokens(html: str) -> tuple[str, str]:
     """Extract (page_token, csrf_token) from ext.to HTML."""
     m = _RE_SEARCH_TOKEN.search(html)
@@ -732,11 +757,16 @@ class ExtToScraper:
                filter_season: Optional[int] = None,
                filter_episode: Optional[int] = None) -> list[dict]:
         effective_query = query.strip()
-        if effective_query and season is not None:
+        if (
+            effective_query
+            and season is not None
+            and not _query_names_target(effective_query, season, episode)
+        ):
             if episode is not None:
                 effective_query = f"{effective_query} S{season:02d}E{episode:02d}"
             else:
                 effective_query = f"{effective_query} S{season:02d}"
+        effective_query = _collapse_duplicate_tokens(effective_query)
 
         pages = max(1, min(int(pages or 1), MAX_WALK_PAGES))
         cache_key = (
@@ -857,10 +887,10 @@ class ExtToScraper:
         if pages > 1:
             # A deep walk returns everything it walked; the caller asked for it.
             logger.info(
-                "deep walk: %d page(s), %d scanned, %d kept%s, %d magnet(s)",
+                "deep walk: %d page(s), %d scanned, %d kept%s, magnets %s",
                 walked, scanned, len(all_results),
                 "" if keep is None else " (filtered to the requested episode)",
-                sum(1 for r in all_results if r.get("magnet_url")),
+                "enriched" if enrich else "deferred to t=download",
             )
             return all_results
 
