@@ -73,6 +73,10 @@ REQUEST_BUDGET = float(os.environ.get("EXT_TO_REQUEST_BUDGET", "120"))
 SESSION_TIMEOUT = float(os.environ.get("EXT_TO_SESSION_TIMEOUT", "45"))
 # A deep walk is capped at ext.to's ~1000-result ceiling: 20 pages of 50.
 MAX_WALK_PAGES = int(os.environ.get("EXT_TO_MAX_WALK_PAGES", "20"))
+# Bound on the total rows held in the search cache. A deep walk caches up to
+# ~1000 parsed rows; keeping 256 of those would be hundreds of MB on a small
+# host, so the cache is bounded by rows as well as entries.
+SEARCH_CACHE_ROWS = int(os.environ.get("EXT_TO_SEARCH_CACHE_ROWS", "4000"))
 # A season pack holds the requested episode, so it is a valid result even though
 # its title names no episode: the target is always the SEASON, and the episode
 # only narrows it. Packs written with season markers work (S07.Complete,
@@ -740,13 +744,32 @@ class ExtToScraper:
             )
 
     @staticmethod
-    def _trim_cache(cache: dict, max_entries: int) -> None:
-        if len(cache) <= max_entries:
-            return
+    def _trim_cache(cache: dict, max_entries: int,
+                    max_rows: Optional[int] = None) -> None:
+        """Evict oldest entries until the cache fits its entry AND row budget.
+
+        A deep walk returns up to ~1000 rows, so entry-count alone is not a
+        memory bound: 256 of those is hundreds of MB of parsed rows. `max_rows`
+        caps the total number of cached rows as well.
+        """
+
+        def rows(entry) -> int:
+            try:
+                return len(entry[1])
+            except TypeError:
+                return 1
+
+        keys_by_age = sorted(cache, key=lambda key: cache[key][0])
+        if max_rows is not None:
+            total = sum(rows(cache[key]) for key in keys_by_age)
+            # Never evict the entry just inserted: an oversized single result is
+            # still worth caching, and keeping one is a bounded overshoot.
+            while len(keys_by_age) > 1 and total > max_rows:
+                key = keys_by_age.pop(0)
+                total -= rows(cache[key])
+                cache.pop(key, None)
         overflow = len(cache) - max_entries
-        for key, _ in sorted(
-            cache.items(), key=lambda item: item[1][0]
-        )[:overflow]:
+        for key in keys_by_age[:max(0, overflow)]:
             cache.pop(key, None)
 
     def search(self, query: str = "", categories: Optional[list[int]] = None,
@@ -811,7 +834,9 @@ class ExtToScraper:
                 time.time() + ttl,
                 [dict(item) for item in results],
             )
-            self._trim_cache(self._search_cache, max_entries=256)
+            self._trim_cache(
+                self._search_cache, max_entries=256, max_rows=SEARCH_CACHE_ROWS
+            )
         return results
 
     def _search_pages(self, effective_query: str,

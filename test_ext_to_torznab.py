@@ -910,3 +910,26 @@ class TestSeasonRangePacks(unittest.TestCase):
 
     def test_a_pack_naming_no_season_cannot_match(self):
         self.assertFalse(ext.title_targets(2, 5)("Show.Complete.Series.1080p"))
+
+
+class TestCacheBounds(unittest.TestCase):
+    def test_cache_is_bounded_by_rows_not_only_entries(self):
+        """A deep walk caches up to ~1000 rows: entries alone bound nothing."""
+
+        cache = {}
+        for index in range(50):
+            cache[f"k{index}"] = (float(index), [{"title": "x"}] * 500)
+
+        ext.ExtToScraper._trim_cache(cache, max_entries=256, max_rows=1000)
+
+        total = sum(len(entry[1]) for entry in cache.values())
+        self.assertLessEqual(total, 1000)
+        self.assertTrue(cache, "the newest entries survive")
+        self.assertIn("k49", cache, "the most recent entry is kept")
+
+    def test_row_bound_never_empties_the_newest_entry(self):
+        cache = {"k": (0.0, [{"title": "x"}] * 5000)}
+
+        ext.ExtToScraper._trim_cache(cache, max_entries=256, max_rows=1000)
+
+        self.assertEqual(list(cache), ["k"])
